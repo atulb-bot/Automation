@@ -1,0 +1,31 @@
+{
+  "name": "flexifunnels-automation",
+  "version": "1.0.0",
+  "description": "Production Playwright + TypeScript E2E QA Automation for FlexiFunnels",
+  "main": "index.js",
+  "scripts": {
+    "test": "playwright test",
+    "test:headed": "playwright test --headed --workers=1",
+    "test:regular": "cross-env FUNNEL_KINDS=regular playwright test --headed --workers=1",
+    "test:oneclick": "cross-env FUNNEL_KINDS=oneclick playwright test --headed --workers=1",
+    "test:debug": "cross-env PWDEBUG=1 playwright test --headed --workers=1",
+    "test:headless": "playwright test --workers=1",
+    "report": "playwright show-report"
+  },
+  "keywords": [
+    "playwright",
+    "typescript",
+    "flexifunnels",
+    "automation",
+    "qa",
+    "testing"
+  ],
+  "author": "QA Team",
+  "license": "ISC",
+  "devDependencies": {
+    "@playwright/test": "^1.42.1",
+    "@types/node": "^20.11.24",
+    "cross-env": "^7.0.3",
+    "typescript": "^5.3.3"
+  }
+}
