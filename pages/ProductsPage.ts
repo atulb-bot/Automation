@@ -53,19 +53,22 @@ export class ProductsPage {
     await expect(createBtn).toBeVisible({ timeout: 20000 });
     await createBtn.click();
     await Helpers.waitForAppReady(this.page); // product-type modal renders async after this click
-    await Helpers.stepDelay(this.page);
+    // Trimmed ~2s off these early steps (up through naming the product) --
+    // they're simple modal/wizard transitions that don't need the full
+    // 4-5s settle every later, heavier step gets.
+    await Helpers.stepDelay(this.page, 2000, 3000);
 
     // 2. Choose "Digital Product" (confirmed accessible name)
     const digitalProductBtn = this.page.getByRole('button', { name: SELECTORS.products.digitalProductType }).first();
     await expect(digitalProductBtn).toBeVisible({ timeout: 15000 });
     await digitalProductBtn.click();
     await Helpers.waitForAppReady(this.page);
-    await Helpers.stepDelay(this.page);
+    await Helpers.stepDelay(this.page, 2000, 3000);
 
     // 3. Continue
     await this.page.getByRole('button', { name: SELECTORS.products.continueBtn, exact: true }).click();
     await Helpers.waitForAppReady(this.page); // wizard step transition — name field isn't wired until this settles
-    await Helpers.stepDelay(this.page);
+    await Helpers.stepDelay(this.page, 2000, 3000);
 
     // 4. Fill product name
     const nameInput = this.page.getByRole('textbox', { name: SELECTORS.products.productNameInput })
@@ -74,7 +77,7 @@ export class ProductsPage {
     await nameInput.click();
     await nameInput.fill(productName);
     await expect(nameInput).toHaveValue(productName, { timeout: 3000 }); // guard against the fill landing before the field is fully interactive
-    await Helpers.stepDelay(this.page);
+    await Helpers.stepDelay(this.page, 2000, 3000);
 
     await PopupHandler.closeFreshChatNotifications(this.page);
 

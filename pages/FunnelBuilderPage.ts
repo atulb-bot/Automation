@@ -611,7 +611,30 @@ export class FunnelBuilderPage {
     }
     if (!chosen) return null;
 
-    await box.selectOption(chosen.value).catch(() => {});
+    let selectFailed = false;
+    await box.selectOption(chosen.value).catch(() => { selectFailed = true; });
+
+    // FIX: previously the selectOption() failure was silently swallowed --
+    // the caller went straight on to log "selected X" and publish, even if
+    // the dropdown never actually registered the choice (this is the
+    // "settings dropdown isn't opening/selecting" symptom). Re-read the
+    // <select>'s own current value right after selecting and confirm it's
+    // really the option we asked for before reporting success.
+    const actualValue = await box.inputValue().catch(() => null);
+    if (selectFailed || actualValue !== chosen.value) {
+      Logger.warn(
+        'FUNNEL_BUILDER',
+        `Selecting "${chosen.label}" in the dropdown did not take (current value: "${actualValue ?? '(unreadable)'}", expected "${chosen.value}") -- retrying once.`
+      );
+      await box.selectOption(chosen.value).catch(() => {});
+      await this.page.waitForTimeout(500);
+      const retryValue = await box.inputValue().catch(() => null);
+      if (retryValue !== chosen.value) {
+        Logger.warn('FUNNEL_BUILDER', `Retry also failed to select "${chosen.label}" -- wiring for this dropdown is unconfirmed.`);
+        return null;
+      }
+    }
+
     return chosen.label || null;
   }
 
@@ -628,18 +651,77 @@ export class FunnelBuilderPage {
    * elements/templates where the toolbar differs.
    */
   private async openElementActionPanel(): Promise<void> {
-    const toolbarIcon = this.page.getByRole('img').filter({ hasText: /^$/ }).nth(5);
-    if (await toolbarIcon.isVisible({ timeout: 4000 }).catch(() => false)) {
-      await toolbarIcon.click();
+    // Confirmed via screenshot: the selected element's toolbar shows exactly
+    // 5 icons (move-up, drag, duplicate, delete, settings-gear) in that
+    // order, so the gear is reliably the 5th -- `div:nth-child(5) > svg >
+    // path` -- tried first now instead of as a fallback.
+    const settingsBtn = this.page.locator('div:nth-child(5) > svg > path')
+      .or(this.page.locator('#ff-tools').getByTitle('Style Settings'))
+      .or(this.page.getByTitle('Style Settings')).first();
+    if (await settingsBtn.isVisible({ timeout: 4000 }).catch(() => false)) {
+      await settingsBtn.click();
+      await this.dismissAdvancedSettingsTooltip();
       return;
     }
 
-    const settingsBtn = this.page.locator('#ff-tools').getByTitle('Style Settings')
-      .or(this.page.getByTitle('Style Settings'))
-      .or(this.page.locator('div:nth-child(5) > svg > path')).first();
-    if (await settingsBtn.isVisible({ timeout: 4000 }).catch(() => false)) {
-      await settingsBtn.click();
+    const toolbarIcon = this.page.getByRole('img').filter({ hasText: /^$/ }).nth(5);
+    if (await toolbarIcon.isVisible({ timeout: 4000 }).catch(() => false)) {
+      await toolbarIcon.click();
+      await this.dismissAdvancedSettingsTooltip();
     }
+  }
+
+  /**
+   * Confirmed via recording: clicking the settings/toolbar icon
+   * (`div:nth-child(5) > svg > path`) to open an element's action panel can
+   * pop a small "Advanced Settings×" tooltip/label on top of that panel.
+   * Until it's dismissed, the "Go To Next Step" button sitting underneath
+   * isn't reliably clickable -- this was previously unhandled, which could
+   * silently no-op the very next click. No-ops quietly if the tooltip never
+   * appears (it isn't shown on every element/template).
+   */
+  private async dismissAdvancedSettingsTooltip(): Promise<void> {
+    const tooltip = this.page.getByText('Advanced Settings×', { exact: false })
+      .or(this.page.getByText(/^Advanced Settings/i));
+    if (await tooltip.first().isVisible({ timeout: 2000 }).catch(() => false)) {
+      await tooltip.first().click().catch(() => {});
+      await this.page.waitForTimeout(500);
+    }
+  }
+
+  /**
+   * Clicks the "Go To Next Step In Funnel/In Product" action and confirms it
+   * actually opened its popup (via `isOpenSignal`) before moving on, instead
+   * of assuming one click was enough.
+   *
+   * FIX: this button renders its own label text PLUS a small arrow/chevron
+   * icon next to it -- on some renders a single click only registers on the
+   * label span, not the arrow, and it's the arrow that actually triggers the
+   * popup to expand. Previously a single un-verified click here was "using
+   * the CTA element's popup" in name only: the click could silently miss,
+   * the code would plow ahead to read dropdowns that were never opened, and
+   * the run would go straight to Publish with nothing actually wired. Now:
+   * click, check the open-signal, and if it didn't open, click the arrow
+   * icon specifically, then retry the full button click -- up to 3 rounds --
+   * before giving up.
+   */
+  private async clickGoToNextStepAndConfirm(
+    nextStepAction: Locator,
+    isOpenSignal: () => Promise<boolean>
+  ): Promise<boolean> {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      await nextStepAction.click({ timeout: 5000 }).catch(() => {});
+      await this.page.waitForTimeout(attempt === 0 ? 3000 : 2000);
+      if (await isOpenSignal()) return true;
+
+      const arrowIcon = nextStepAction.locator('svg, [class*="arrow" i], [class*="chevron" i]').first();
+      if (await arrowIcon.isVisible({ timeout: 1500 }).catch(() => false)) {
+        await arrowIcon.click({ timeout: 3000 }).catch(() => {});
+        await this.page.waitForTimeout(2000);
+        if (await isOpenSignal()) return true;
+      }
+    }
+    return false;
   }
 
   /**
@@ -663,12 +745,14 @@ export class FunnelBuilderPage {
       Logger.warn('FUNNEL_BUILDER', `"Go To Next Step" action not found for ${contextLabel} — element was selected but not wired to a funnel step.`);
       return false;
     }
-    await nextStepAction.click();
 
-    // Give the popup a moment to actually render before reading its
-    // dropdowns -- clicking straight through here is what let the old code
-    // read a not-yet-hydrated <select> and silently keep its placeholder.
-    await this.page.waitForTimeout(3000);
+    const opened = await this.clickGoToNextStepAndConfirm(nextStepAction, async () => {
+      return (await this.page.getByRole('combobox').count().catch(() => 0)) > 0;
+    });
+    if (!opened) {
+      Logger.warn('FUNNEL_BUILDER', `${contextLabel}: "Go To Next Step" popup never opened after retries (including the arrow icon) — nothing was wired.`);
+      return false;
+    }
 
     const comboboxes = this.page.getByRole('combobox');
     await comboboxes.first().waitFor({ state: 'visible', timeout: 8000 }).catch(() => {});
@@ -678,7 +762,11 @@ export class FunnelBuilderPage {
       // First dropdown: search for the funnel by name rather than blindly
       // taking whatever sits first.
       const funnelLabel = await this.selectComboboxOptionByText(comboboxes.nth(0), funnelName);
-      Logger.info('FUNNEL_BUILDER', `${contextLabel}: selected funnel "${funnelLabel ?? funnelName ?? '(default)'}".`);
+      if (funnelLabel) {
+        Logger.info('FUNNEL_BUILDER', `${contextLabel}: selected funnel "${funnelLabel}".`);
+      } else {
+        Logger.warn('FUNNEL_BUILDER', `${contextLabel}: could NOT confirm the funnel dropdown selected "${funnelName ?? '(default)'}" -- wiring may be pointing at the wrong or no funnel.`);
+      }
       // Selecting the funnel repopulates the target-step dropdown — give it
       // a moment before reading/selecting from it.
       await this.page.waitForTimeout(3000);
@@ -687,7 +775,11 @@ export class FunnelBuilderPage {
       // Second dropdown: select the correct product/page for the page we're
       // currently wiring, not just index 1.
       const targetLabel = await this.selectComboboxOptionByText(comboboxes.nth(1), expectedNextPageName);
-      Logger.info('FUNNEL_BUILDER', `${contextLabel}: selected next-step target "${targetLabel ?? expectedNextPageName ?? '(default)'}".`);
+      if (targetLabel) {
+        Logger.info('FUNNEL_BUILDER', `${contextLabel}: selected next-step target "${targetLabel}" -- confirmed wired to "${expectedNextPageName ?? '(default)'}".`);
+      } else {
+        Logger.warn('FUNNEL_BUILDER', `${contextLabel}: could NOT confirm the target-step dropdown selected "${expectedNextPageName ?? '(default)'}" -- this CTA may not be wired to the correct page. Check manually.`);
+      }
     }
     await this.page.waitForTimeout(3000);
 
@@ -729,16 +821,46 @@ export class FunnelBuilderPage {
       Logger.warn('FUNNEL_BUILDER', `"Go To Next Step In Product" action not found for ${contextLabel} — element was selected but not wired.`);
       return false;
     }
-    await nextStepAction.click();
-
-    // Give the popup a moment to actually render before touching it.
-    await this.page.waitForTimeout(3000);
 
     // "--select a one--" is the literal placeholder confirmed via recording;
     // the regex fallback covers any similarly-worded placeholder in case it
     // varies by page/template.
     const dropdownTrigger = this.page.getByRole('button', { name: '--select a one--' })
       .or(this.page.getByRole('button', { name: /^--\s*select a .*--$/i })).first();
+
+    // Confirmed via recording: the popup can render an "Add Product"
+    // step-type selector (a plain div, not a <button>) that has to be
+    // clicked before "--select a one--" becomes the active picker. This
+    // only showed up the FIRST time the popup was used on a given page in
+    // the recording (a second "Go To Next Step In Product" use later on the
+    // same page skipped straight to "--select a one--") -- so this is
+    // treated as optional/best-effort here, matching that: click it if
+    // present, proceed either way if it isn't.
+    const addProductDiv = this.page.locator('div').filter({ hasText: /^Add Product$/ }).first();
+
+    // FIX ("clicks settings but doesn't actually use the popup to wire the
+    // button"): this button has its own arrow/chevron next to the label --
+    // one un-verified click isn't always enough to actually expand the
+    // popup. Click, check the dropdown trigger (or the "Add Product"
+    // step-selector) rendered, retry (incl. the arrow icon) before giving
+    // up -- rather than plowing ahead to "--select a one--" that was never
+    // actually shown.
+    const opened = await this.clickGoToNextStepAndConfirm(nextStepAction, async () => {
+      return (
+        (await dropdownTrigger.isVisible({ timeout: 1000 }).catch(() => false)) ||
+        (await addProductDiv.isVisible({ timeout: 1000 }).catch(() => false))
+      );
+    });
+    if (!opened) {
+      Logger.warn('FUNNEL_BUILDER', `${contextLabel}: "Go To Next Step In Product" popup never opened after retries (including the arrow icon) — nothing was wired.`);
+      return false;
+    }
+
+    if (await addProductDiv.isVisible({ timeout: 2500 }).catch(() => false)) {
+      Logger.info('FUNNEL_BUILDER', `${contextLabel}: clicking "Add Product" step-selector before the product picker...`);
+      await addProductDiv.click().catch(() => {});
+      await this.page.waitForTimeout(800);
+    }
 
     if (!(await dropdownTrigger.isVisible({ timeout: 6000 }).catch(() => false))) {
       Logger.warn('FUNNEL_BUILDER', `No target dropdown trigger found for ${contextLabel} — nothing to wire.`);
@@ -750,16 +872,39 @@ export class FunnelBuilderPage {
       return false;
     }
 
-    let wired = true;
-    await Helpers.selectProductFromDropdown(this.page, dropdownTrigger, expectedNextPageName).catch((err: unknown) => {
-      wired = false;
-      Logger.warn(
-        'FUNNEL_BUILDER',
-        `${contextLabel}: could not select "${expectedNextPageName}" in the target dropdown (${err instanceof Error ? err.message : String(err)}).`
+    // FIX ("dropdown until the proper product is wired should wait there"):
+    // don't trust a single selectProductFromDropdown() call and move on
+    // regardless. After selecting, re-read what the trigger button now
+    // displays and only accept it once it visibly shows the target product
+    // (not still the "--select a one--" placeholder) -- retrying the whole
+    // search-and-select a few times if it doesn't.
+    let wired = false;
+    for (let attempt = 0; attempt < 3 && !wired; attempt++) {
+      await Helpers.selectProductFromDropdown(this.page, dropdownTrigger, expectedNextPageName).catch((err: unknown) => {
+        Logger.warn(
+          'FUNNEL_BUILDER',
+          `${contextLabel}: attempt ${attempt + 1}/3 to select "${expectedNextPageName}" failed (${err instanceof Error ? err.message : String(err)}).`
+        );
+      });
+      await this.page.waitForTimeout(800);
+      const currentLabel = (await dropdownTrigger.innerText().catch(() => '')).trim();
+      const stillPlaceholder = /^--\s*select a .*--$/i.test(currentLabel) || currentLabel.length === 0;
+      wired = !stillPlaceholder && (
+        currentLabel.toLowerCase().includes(expectedNextPageName.toLowerCase()) ||
+        expectedNextPageName.toLowerCase().includes(currentLabel.toLowerCase())
       );
-    });
+      if (!wired) {
+        Logger.warn(
+          'FUNNEL_BUILDER',
+          `${contextLabel}: dropdown shows "${currentLabel || '(placeholder)'}" after attempt ${attempt + 1}/3 — waiting and retrying until "${expectedNextPageName}" is actually wired.`
+        );
+        await this.page.waitForTimeout(1200);
+      }
+    }
     if (wired) {
-      Logger.info('FUNNEL_BUILDER', `${contextLabel}: selected next-step target "${expectedNextPageName}".`);
+      Logger.info('FUNNEL_BUILDER', `${contextLabel}: confirmed next-step target wired to "${expectedNextPageName}".`);
+    } else {
+      Logger.warn('FUNNEL_BUILDER', `${contextLabel}: could NOT confirm "${expectedNextPageName}" was selected after 3 attempts — wiring is unconfirmed, check manually.`);
     }
     await this.page.waitForTimeout(3000);
 
@@ -796,11 +941,37 @@ export class FunnelBuilderPage {
     })).first();
 
     if (!(await noThanksLink.isVisible({ timeout: 6000 }).catch(() => false))) {
+      // FIX: this used to just skip when the template had no built-in decline
+      // link. Per spec, the sales page should always get a "No thanks" path
+      // wired the same way the main CTA button is -- so insert a decline
+      // button and wire it instead of leaving the path unwired.
+      //
+      // Confirmed via recording: FlexiFunnels ships a dedicated "No Thanks
+      // Button" block (Blocks -> Components -> getByTitle('No Thanks
+      // Button')) distinct from the generic "Button" element -- it comes
+      // pre-labelled "No thanks", so try that FIRST. Only fall back to the
+      // generic addNewCTAButton() (which needs no relabeling either, but
+      // isn't the confirmed decline-specific component) if this template
+      // doesn't render that block.
       Logger.warn(
         'FUNNEL_BUILDER',
-        `No "No thanks"-style link found on the "${salesPageName}" template — it may not include one. ` +
-        `Skipping rather than inventing a new page element (add one manually in the editor if this template needs it).`
+        `No "No thanks"-style link found on the "${salesPageName}" template — inserting the dedicated "No Thanks Button" block.`
       );
+      let newNoThanks = await this.addNoThanksBlock(editorFrame, `"${salesPageName}" No-thanks button`);
+      if (!newNoThanks) {
+        Logger.warn('FUNNEL_BUILDER', `"No Thanks Button" block unavailable for "${salesPageName}" — falling back to a generic button.`);
+        newNoThanks = await this.addNewCTAButton(editorFrame, `"${salesPageName}" No-thanks button`);
+      }
+      if (!newNoThanks) {
+        Logger.warn('FUNNEL_BUILDER', `Could not add a fallback "No thanks" button on "${salesPageName}" — skipping.`);
+        return;
+      }
+      await newNoThanks.click().catch(() => {});
+      await this.page.waitForTimeout(2000);
+      const wiredNew = await this.wireSelectedElementToNextStep(funnelName, targetPageName, `"${salesPageName}" No-thanks button`);
+      if (wiredNew) {
+        Logger.info('FUNNEL_BUILDER', `✅ Added and wired a new "No thanks" button on "${salesPageName}" -> "${targetPageName}".`);
+      }
       return;
     }
 
@@ -836,70 +1007,55 @@ export class FunnelBuilderPage {
   ): Promise<import('@playwright/test').Locator | null> {
     Logger.info('FUNNEL_BUILDER', `Adding a new CTA button for ${contextLabel}...`);
 
-    // Direct, no-hunting selection: wait for the first section's heading to
-    // actually be ready, then click it TWICE (confirmed pattern -- a single
-    // click wasn't reliably revealing the inline "+" add-element icon).
-    // Deliberately not trying several element types (paragraph, span, etc.)
-    // in sequence anymore -- one known target, clicked twice.
+    // FIXED FLOW (explicit instruction, confirmed against the editor's own
+    // layout in a screenshot): Edit Page -> click the page's paragraph
+    // element -> Components -> Elements -> Button. NOT Blocks at all, and
+    // NOT the inline "+" icon / existing-CTA-double-click branching that
+    // used to live here -- that branching is exactly what was producing the
+    // erratic "Components -> Blocks -> Components again" sequence, because
+    // one path's failure silently fell into a completely different path.
+    // One deterministic sequence now, no hunting.
     const firstSection = editorFrame.locator('section').first();
     const sectionScope = (await firstSection.count().catch(() => 0)) > 0 ? firstSection : editorFrame.locator('body');
-    const heading = sectionScope.locator('h1, h2, h3').first();
+    const paragraph = sectionScope.locator('p').first();
 
-    const headingReady = await heading.isVisible({ timeout: 15000 }).catch(() => false);
-    if (headingReady) {
-      await heading.click().catch(() => {});
+    const paragraphReady = await paragraph.isVisible({ timeout: 15000 }).catch(() => false);
+    if (paragraphReady) {
+      await paragraph.click().catch(() => {});
       await this.page.waitForTimeout(1000);
-      await heading.click().catch(() => {});
-      // Longer settle time here -- clicking straight through to the add
-      // icon before the editor fully registers the selection was the cause
-      // of the button sometimes not landing/loading properly.
-      await this.page.waitForTimeout(2000);
     } else {
-      Logger.warn('FUNNEL_BUILDER', `Could not find a heading in the first section to select for ${contextLabel} — new button may land wherever the editor defaults to.`);
+      Logger.warn('FUNNEL_BUILDER', `Could not find a paragraph in the first section to select for ${contextLabel} — new button may land wherever the editor defaults to.`);
     }
 
-    // Primary path (confirmed via recording): the inline "+" icon that
-    // appears once an element is selected opens a small element picker
-    // directly -- no need to open the Blocks/Components/Elements sidebar.
-    const inlineAddIcon = this.page.locator('#ftv2-add-btn > svg > path').or(this.page.locator('#ftv2-add-btn')).first();
-    const usedInlineAdd = await inlineAddIcon.isVisible({ timeout: 6000 }).catch(() => false);
-
-    if (usedInlineAdd) {
-      await inlineAddIcon.click();
-      await this.page.waitForTimeout(1200);
-    } else {
-      // Fallback: the sidebar path confirmed via the FIRST recording, for
-      // templates/pages where the inline "+" icon doesn't render.
-      Logger.warn('FUNNEL_BUILDER', `Inline "+" add icon not found for ${contextLabel} — falling back to the Blocks/Components/Elements panel.`);
-
-      const blocksBtn = this.page.getByRole('button', { name: 'Blocks' });
-      if (await blocksBtn.isVisible({ timeout: 8000 }).catch(() => false)) {
-        await blocksBtn.click();
-        await this.page.waitForTimeout(800);
-      }
-
-      const componentsBtn = this.page.getByRole('button', { name: 'Components' });
-      if (!(await componentsBtn.isVisible({ timeout: 8000 }).catch(() => false))) {
-        Logger.warn('FUNNEL_BUILDER', `"Components" panel not found for ${contextLabel}.`);
-        return null;
-      }
-      await componentsBtn.click();
-      await this.page.waitForTimeout(800);
-
-      const elementsBtn = this.page.getByRole('button', { name: 'Elements' });
-      if (!(await elementsBtn.isVisible({ timeout: 8000 }).catch(() => false))) {
-        Logger.warn('FUNNEL_BUILDER', `"Elements" panel not found for ${contextLabel}.`);
-        return null;
-      }
-      await elementsBtn.click();
-      await this.page.waitForTimeout(800);
+    const componentsBtn = this.page.getByRole('button', { name: 'Components' });
+    if (!(await componentsBtn.isVisible({ timeout: 8000 }).catch(() => false))) {
+      Logger.warn('FUNNEL_BUILDER', `"Components" panel not found for ${contextLabel}.`);
+      return null;
     }
+    await componentsBtn.click();
+    await this.page.waitForTimeout(800);
+
+    const elementsBtn = this.page.getByRole('button', { name: 'Elements' });
+    if (!(await elementsBtn.isVisible({ timeout: 8000 }).catch(() => false))) {
+      Logger.warn('FUNNEL_BUILDER', `"Elements" panel not found for ${contextLabel}.`);
+      return null;
+    }
+    await elementsBtn.click();
+    await this.page.waitForTimeout(800);
 
     const buttonElementOption = this.page.getByTitle('Button', { exact: true });
     if (!(await buttonElementOption.isVisible({ timeout: 8000 }).catch(() => false))) {
       Logger.warn('FUNNEL_BUILDER', `"Button" element option not found for ${contextLabel}.`);
       return null;
     }
+
+    // FIX ("randomly selects any button" bug): count how many button/link-
+    // like elements exist BEFORE inserting, so the fallback below can prove
+    // a genuinely new element landed instead of just grabbing whatever was
+    // already last in the DOM.
+    const candidateSelector = 'a[class*="btn"], button, [data-gjs-type="link"]';
+    const countBefore = await editorFrame.locator(candidateSelector).count().catch(() => 0);
+
     await buttonElementOption.click();
     // Longer wait for the new button element to actually finish rendering
     // on the canvas before we try to select/wire it -- this was the main
@@ -909,19 +1065,105 @@ export class FunnelBuilderPage {
     // Confirmed via the second recording: the newly inserted button has a
     // real, stable default accessible name -- "Click Here to Get Access" --
     // so it can be targeted directly instead of guessing "whatever is last
-    // on the canvas". Falls back to the old last-element heuristic in case
-    // a different template ships a different default label.
+    // on the canvas".
     const namedInserted = editorFrame.getByRole('link', { name: 'Click Here to Get Access' }).last();
     if (await namedInserted.isVisible({ timeout: 6000 }).catch(() => false)) {
       return namedInserted;
     }
 
-    const inserted = editorFrame.locator('a[class*="btn"], button, [data-gjs-type="link"]').last();
-    if (await inserted.isVisible({ timeout: 8000 }).catch(() => false)) {
-      return inserted;
+    // FIX: this used to fall back to `.last()` of every button/link-like
+    // element on the page UNCONDITIONALLY. If the insert above silently
+    // failed (template quirk, panel didn't render, slow load, etc.), that
+    // still returned SOME pre-existing element on the page -- and the
+    // caller would go on to select and wire that random existing button,
+    // which is exactly the "opens a popup for a random button" bug you saw.
+    // Only trust this fallback if the candidate count actually grew,
+    // proving a new element really landed; otherwise report failure so the
+    // caller uses its own template-CTA fallback instead of guessing.
+    const countAfter = await editorFrame.locator(candidateSelector).count().catch(() => countBefore);
+    if (countAfter > countBefore) {
+      const inserted = editorFrame.locator(candidateSelector).last();
+      if (await inserted.isVisible({ timeout: 8000 }).catch(() => false)) {
+        return inserted;
+      }
     }
 
-    Logger.warn('FUNNEL_BUILDER', `New CTA button did not appear on canvas for ${contextLabel}.`);
+    Logger.warn(
+      'FUNNEL_BUILDER',
+      `New CTA button did not appear on canvas for ${contextLabel} (element count unchanged: ${countBefore}) -- refusing to guess at an existing element.`
+    );
+    return null;
+  }
+
+  /**
+   * Inserts FlexiFunnels' dedicated "No Thanks Button" block (Blocks ->
+   * Components -> getByTitle('No Thanks Button')), confirmed via a live
+   * recording to be a genuinely separate component from the generic
+   * "Button" element that addNewCTAButton() inserts -- not the same block
+   * relabeled. It ships with its own default link text ("No thanks"), so no
+   * rename step is needed and the caller can target it by that text.
+   *
+   * This is tried FIRST by wireNoThanksLink() when a template has no
+   * built-in decline link; addNewCTAButton() remains the fallback for
+   * templates/panels where this specific block doesn't render.
+   */
+  private async addNoThanksBlock(
+    editorFrame: import('@playwright/test').FrameLocator,
+    contextLabel: string
+  ): Promise<import('@playwright/test').Locator | null> {
+    Logger.info('FUNNEL_BUILDER', `Adding the dedicated "No Thanks Button" block for ${contextLabel}...`);
+
+    const blocksBtn = this.page.getByRole('button', { name: 'Blocks' });
+    if (await blocksBtn.isVisible({ timeout: 8000 }).catch(() => false)) {
+      await blocksBtn.click();
+      await this.page.waitForTimeout(800);
+    }
+
+    const componentsBtn = this.page.getByRole('button', { name: 'Components' });
+    if (!(await componentsBtn.isVisible({ timeout: 8000 }).catch(() => false))) {
+      Logger.warn('FUNNEL_BUILDER', `"Components" panel not found for ${contextLabel} (No Thanks block) -- falling back to generic button.`);
+      return null;
+    }
+    await componentsBtn.click();
+    await this.page.waitForTimeout(800);
+
+    const noThanksBlockOption = this.page.getByTitle('No Thanks Button');
+    if (!(await noThanksBlockOption.isVisible({ timeout: 8000 }).catch(() => false))) {
+      Logger.warn('FUNNEL_BUILDER', `"No Thanks Button" block option not found for ${contextLabel} -- this template may not ship it.`);
+      return null;
+    }
+
+    const candidateSelector = 'a[class*="btn"], button, [data-gjs-type="link"]';
+    const countBefore = await editorFrame.locator(candidateSelector).count().catch(() => 0);
+
+    await noThanksBlockOption.click();
+    // Same settle window as addNewCTAButton() -- give the new element real
+    // time to finish rendering before selecting/wiring it.
+    await this.page.waitForTimeout(3000);
+
+    // Confirmed via recording: this block's own default accessible name is
+    // "No thanks" (distinct from the generic Button's "Click Here to Get
+    // Access"), so it can be targeted directly.
+    const namedInserted = editorFrame.getByRole('link', { name: /No,?\s*thanks/i }).last();
+    if (await namedInserted.isVisible({ timeout: 6000 }).catch(() => false)) {
+      return namedInserted;
+    }
+
+    // Same guard as addNewCTAButton(): only trust the "last element on the
+    // canvas" fallback if the element count actually grew, so a silently
+    // failed insert never returns some pre-existing element to wire instead.
+    const countAfter = await editorFrame.locator(candidateSelector).count().catch(() => countBefore);
+    if (countAfter > countBefore) {
+      const inserted = editorFrame.locator(candidateSelector).last();
+      if (await inserted.isVisible({ timeout: 8000 }).catch(() => false)) {
+        return inserted;
+      }
+    }
+
+    Logger.warn(
+      'FUNNEL_BUILDER',
+      `"No Thanks Button" block did not appear on canvas for ${contextLabel} (element count unchanged: ${countBefore}).`
+    );
     return null;
   }
 
@@ -1009,7 +1251,8 @@ export class FunnelBuilderPage {
 
   public async wireSalesPageToProduct(
     salesPageName: string,
-    expectedNextPageName: string
+    expectedNextPageName: string,
+    noThanksTargetPageName?: string
   ): Promise<void> {
     this.context.recordStep(`Wire Sales Page CTA (Product): ${salesPageName}`);
     Logger.info('FUNNEL_BUILDER', `Wiring "${salesPageName}" CTA button to Next Step in Product...`);
@@ -1029,11 +1272,24 @@ export class FunnelBuilderPage {
       await el.click();
     };
 
-    // Same approach as the funnel path: add a fresh Button element rather
-    // than wiring the template's own inbuilt one, falling back to the
-    // template's CTA only if the insert sequence doesn't render.
+    // Confirmed via recording: BOTH elements get inserted back-to-back
+    // (main CTA via Components -> Elements -> Button, then the decline
+    // button via Blocks -> Components -> "No Thanks Button") before either
+    // one is selected and wired -- not insert-wire-insert-wire. Matches that
+    // order here so the panel state (Blocks/Components already open, etc.)
+    // matches what was actually exercised.
     const newCta = await this.addNewCTAButton(editorFrame, `"${salesPageName}" main CTA`);
 
+    let newNoThanks: import('@playwright/test').Locator | null = null;
+    if (noThanksTargetPageName) {
+      newNoThanks = await this.addNoThanksBlock(editorFrame, `"${salesPageName}" No-thanks button`);
+      if (!newNoThanks) {
+        Logger.warn('FUNNEL_BUILDER', `"No Thanks Button" block unavailable for "${salesPageName}" — falling back to a generic button for the decline path.`);
+        newNoThanks = await this.addNewCTAButton(editorFrame, `"${salesPageName}" No-thanks button (fallback)`);
+      }
+    }
+
+    // Now select and wire the main CTA.
     if (newCta) {
       // Confirmed via recording: a single click selects the freshly-inserted
       // element; the toolbar icon (see openElementActionPanel()) is what
@@ -1041,31 +1297,72 @@ export class FunnelBuilderPage {
       await newCta.click().catch(() => {});
       await this.page.waitForTimeout(2000);
     } else {
-      Logger.warn('FUNNEL_BUILDER', `Could not add a new CTA button on "${salesPageName}" — falling back to wiring the template's existing button.`);
-      const cta = ctaScope.getByRole('link', {
-        name: /Start Free Trial|Join|Buy|Enroll|Order|Get Started|Get Access|Click Here/i,
-      }).first();
-      if (await cta.isVisible({ timeout: 15000 }).catch(() => false)) {
-        await clickTwiceToOpenEditor(cta);
-      } else {
-        const fallbackEl = editorFrame.locator('a[class*="btn"], button, [data-gjs-type="link"]').first();
-        await clickTwiceToOpenEditor(fallbackEl).catch(() => {});
-      }
+      // Per explicit instruction: never fall back to wiring a pre-existing
+      // template button (it's not the button we actually control/verified,
+      // and silently wiring the wrong element is worse than failing loudly
+      // here so the real problem -- addNewCTAButton() not finding the
+      // heading/add-icon -- gets fixed instead of masked).
+      throw new Error(
+        `Could not add a new CTA button on "${salesPageName}" — refusing to fall back to a pre-existing template button. ` +
+        `Check that the first section's heading and the inline "+" add-element icon are rendering as expected.`
+      );
     }
     await this.page.waitForTimeout(3000);
 
-    await this.wireSelectedElementToProductNextStep(expectedNextPageName, `"${salesPageName}" main CTA`);
+    // FIX ("publishing the page before wiring the button"): the return
+    // value here used to be discarded entirely -- Publish fired regardless
+    // of whether the popup was ever actually used to wire the CTA. Now the
+    // result is checked, and if it's not confirmed, we retry the wiring
+    // once more (the button is still selected in the editor) before
+    // publishing rather than racing straight to Publish.
+    let wired = await this.wireSelectedElementToProductNextStep(expectedNextPageName, `"${salesPageName}" main CTA`);
+    if (!wired) {
+      Logger.warn('FUNNEL_BUILDER', `"${salesPageName}" main CTA was not confirmed wired — retrying once before publishing.`);
+      await this.page.waitForTimeout(1500);
+      wired = await this.wireSelectedElementToProductNextStep(expectedNextPageName, `"${salesPageName}" main CTA (retry)`);
+    }
+    if (!wired) {
+      Logger.warn('FUNNEL_BUILDER', `"${salesPageName}" main CTA still not confirmed wired after retry — publishing anyway, but check this page manually.`);
+    }
+
+    // Now select and wire the "No thanks" decline path, if requested.
+    // Confirmed via recording: this step is selected fresh straight from the
+    // iframe by its default accessible name ("No thanks") with a SINGLE
+    // click -- no double-click, no pre-emptive toolbar-icon click needed
+    // before "Go To Next Step In Product" appears (unlike the main CTA,
+    // where the settings-icon + "Advanced Settings×" dismissal was needed).
+    // wireSelectedElementToProductNextStep() still tries the toolbar icon
+    // first (openElementActionPanel()) as a harmless no-op if it's not
+    // actually there.
+    if (noThanksTargetPageName) {
+      const noThanksLink = newNoThanks ?? editorFrame.getByRole('link', { name: /No,?\s*thanks/i }).first();
+      if (await noThanksLink.isVisible({ timeout: 6000 }).catch(() => false)) {
+        await noThanksLink.click().catch(() => {});
+        await this.page.waitForTimeout(1500);
+
+        let noThanksWired = await this.wireSelectedElementToProductNextStep(noThanksTargetPageName, `"${salesPageName}" No-thanks button`);
+        if (!noThanksWired) {
+          Logger.warn('FUNNEL_BUILDER', `"${salesPageName}" No-thanks button was not confirmed wired — retrying once before publishing.`);
+          await this.page.waitForTimeout(1500);
+          noThanksWired = await this.wireSelectedElementToProductNextStep(noThanksTargetPageName, `"${salesPageName}" No-thanks button (retry)`);
+        }
+        if (!noThanksWired) {
+          Logger.warn('FUNNEL_BUILDER', `"${salesPageName}" No-thanks button still not confirmed wired after retry — publishing anyway, but check this page manually.`);
+        }
+      } else {
+        Logger.warn('FUNNEL_BUILDER', `Could not locate the "No thanks" button to wire on "${salesPageName}" — skipping its decline path.`);
+      }
+    }
 
     // Extra settle time between finishing the product-connection step and
     // hitting Publish -- publishing was firing before the connection had
     // actually registered.
-    await this.page.waitForTimeout(2500);
+    await this.page.waitForTimeout(3000);
 
     await this.page.getByRole('button', { name: 'Publish Publish the page live.' }).click();
-    // Confirmed via recording: give the publish action a couple of seconds
-    // to actually complete before touching anything else -- clicking too
-    // soon after Publish is what was making the follow-up steps unreliable.
-    await this.page.waitForTimeout(3000);
+    // Minimum 3-4s settle after Publish so the page actually finishes
+    // publishing before anything else touches it.
+    await this.page.waitForTimeout(4000);
 
     const publishAsSales = this.page.getByRole('button', { name: 'Publish as Sales Page' });
     if (await publishAsSales.isVisible({ timeout: 6000 }).catch(() => false)) {
@@ -1126,29 +1423,31 @@ export class FunnelBuilderPage {
     if (newCta) {
       // Confirmed via recording: only ONE click on the freshly-inserted
       // element is needed to select it before the toolbar icon opens its
-      // action panel -- "click twice" is kept only for the fallback below
-      // (wiring the template's own pre-existing button), which hasn't been
-      // re-confirmed against a live recording.
+      // action panel.
       await newCta.click().catch(() => {});
       await this.page.waitForTimeout(2000);
     } else {
-      // Couldn't insert a new button for some reason (template quirk, panel
-      // selectors didn't render, etc.) -- fall back to the old behavior
-      // rather than leaving the page completely unwired.
-      Logger.warn('FUNNEL_BUILDER', `Could not add a new CTA button on "${salesPageName}" — falling back to wiring the template's existing button.`);
-      const cta = ctaScope.getByRole('link', {
-        name: /Start Free Trial|Join|Buy|Enroll|Order|Get Started|Get Access|Click Here/i,
-      }).first();
-      if (await cta.isVisible({ timeout: 15000 }).catch(() => false)) {
-        await clickTwiceToOpenEditor(cta);
-      } else {
-        const fallbackEl = editorFrame.locator('a[class*="btn"], button, [data-gjs-type="link"]').first();
-        await clickTwiceToOpenEditor(fallbackEl).catch(() => {});
-      }
+      // Per explicit instruction: never fall back to wiring a pre-existing
+      // template button -- fail loudly here instead of silently wiring the
+      // wrong element, so the real problem gets fixed rather than masked.
+      throw new Error(
+        `Could not add a new CTA button on "${salesPageName}" — refusing to fall back to a pre-existing template button. ` +
+        `Check that the first section's heading and the inline "+" add-element icon are rendering as expected.`
+      );
     }
     await this.page.waitForTimeout(3000);
 
-    await this.wireSelectedElementToNextStep(funnelName, expectedNextPageName, `"${salesPageName}" main CTA`);
+    // Same publish-gating fix as wireSalesPageToProduct: don't discard the
+    // wiring result and publish blind. Retry once if unconfirmed.
+    let wired = await this.wireSelectedElementToNextStep(funnelName, expectedNextPageName, `"${salesPageName}" main CTA`);
+    if (!wired) {
+      Logger.warn('FUNNEL_BUILDER', `"${salesPageName}" main CTA was not confirmed wired — retrying once before publishing.`);
+      await this.page.waitForTimeout(1500);
+      wired = await this.wireSelectedElementToNextStep(funnelName, expectedNextPageName, `"${salesPageName}" main CTA (retry)`);
+    }
+    if (!wired) {
+      Logger.warn('FUNNEL_BUILDER', `"${salesPageName}" main CTA still not confirmed wired after retry — publishing anyway, but check this page manually.`);
+    }
 
     // Secondary "No thanks" decline link, only for pages that actually have
     // a downsell to skip to (OTO1 -> DS1, OTO2 -> DS2).
@@ -1159,12 +1458,12 @@ export class FunnelBuilderPage {
     // Extra settle time between finishing the connection step(s) and hitting
     // Publish -- publishing was firing before the connection had actually
     // registered.
-    await this.page.waitForTimeout(2500);
+    await this.page.waitForTimeout(3000);
 
     await this.page.getByRole('button', { name: 'Publish Publish the page live.' }).click();
-    // Confirmed via recording: give the publish action a couple of seconds
-    // to actually complete before touching anything else.
-    await this.page.waitForTimeout(3000);
+    // Minimum 3-4s settle after Publish so the page actually finishes
+    // publishing before anything else touches it.
+    await this.page.waitForTimeout(4000);
 
     const publishAsSales = this.page.getByRole('button', { name: 'Publish as Sales Page' });
     if (await publishAsSales.isVisible({ timeout: 6000 }).catch(() => false)) {
@@ -1207,7 +1506,10 @@ export class FunnelBuilderPage {
       return;
     }
     await publishBtn.click();
-    await this.page.waitForTimeout(3000);
+    // Minimum 3-4s settle after Publish, same as the sales-page publish
+    // path, so this page actually finishes publishing before anything else
+    // touches it.
+    await this.page.waitForTimeout(4000);
 
     if (publishAsButtonPattern) {
       const confirmBtn = this.page.getByRole('button', { name: new RegExp(publishAsButtonPattern.replace(/[().]/g, '.'), 'i') }).first();

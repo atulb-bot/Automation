@@ -14,11 +14,12 @@ import { PaymentPage } from '../pages/PaymentPage';
 /**
  * Single-product, no-funnel run: login -> create project -> create ONLY the
  * 3 pages a standalone product needs (FE Sales, FE Checkout, Thank You) ->
- * create ONE product wired to those pages -> add a new CTA button on the
- * Sales page and wire it via the product-level "Go To Next Step In Product"
- * step (there is no funnel here, so the funnel-wiring popup/dropdown never
- * comes into play) -> publish Sales, Checkout, and Thank You -> run a live
- * buyer purchase and verify it lands on the Thank You page.
+ * create ONE product wired to those pages -> add a new CTA button AND a
+ * "No thanks" decline button on the Sales page and wire both via the
+ * product-level "Go To Next Step In Product" step (there is no funnel here,
+ * so the funnel-wiring popup/dropdown never comes into play) -> publish
+ * Sales, Checkout, and Thank You -> run a live buyer purchase and verify it
+ * lands on the Thank You page.
  *
  * Does NOT call FunnelBuilderPage.createFunnel() or wireAllSalesPages() --
  * those are the funnel-tree path used by full-funnel-flow.spec.ts and are
@@ -81,9 +82,18 @@ test.describe('FlexiFunnels Single Product (No Funnel)', () => {
     Logger.info('FLOW', `✅ "${product.productName}" configured (no funnel).`);
 
     // 4. No funnel tree here. Add a new CTA button on FE Sales and wire it
-    // via the product-level "Go To Next Step In Product" popup, straight to
-    // this product's own Checkout page.
-    await funnelBuilderPage.wireSalesPageToProduct(product.salesPageName, product.checkoutPageName);
+    // via the product-level "Go To Next Step In Product" popup. IMPORTANT:
+    // that popup's "Add Product" search lists PRODUCTS (e.g. "QA xxx FE"),
+    // never pages — passing a page name like "FE Checkout" here always
+    // returns "No matches" (confirmed). Selecting the product ITSELF is
+    // what sends the buyer to its checkout — there's no separate downsell
+    // product in a single-product/no-funnel run, so both the main CTA and
+    // the "No thanks" decline button wire to this same product.
+    await funnelBuilderPage.wireSalesPageToProduct(
+      product.salesPageName,
+      product.productName,
+      product.productName
+    );
 
     // 4b. Publish Checkout + Thank You now that the CTA is wired.
     await funnelBuilderPage.publishAllCheckoutPages([product]);

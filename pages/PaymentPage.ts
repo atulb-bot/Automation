@@ -13,12 +13,31 @@ export class PaymentPage {
     await PopupHandler.dismissKnownPopups(livePage);
     await livePage.waitForTimeout(2000);
 
+    // FIX: the button this framework actually inserts and wires has a
+    // stable default label -- "Click Here to Get Access" -- but that exact
+    // text wasn't in ANY of the matchers below. If the href-based match
+    // below ever missed (or, since the "No thanks" button can now be wired
+    // to the same Checkout page as the main CTA, if it matched THAT button
+    // instead since both hrefs point at "checkout"), the buyer journey
+    // could silently click the wrong element. Try the exact button we added
+    // first, explicitly excluding anything reading "No thanks".
+    const ourCta = livePage.getByRole('link', { name: 'Click Here to Get Access' })
+      .filter({ hasNotText: /No,?\s*thanks/i }).first();
+    if (await ourCta.isVisible({ timeout: 8000 }).catch(() => false)) {
+      await ourCta.click();
+      Logger.info('BUYER', 'Clicked the CTA button this framework added and wired. Transitioning to Checkout...');
+      return;
+    }
+
     // Prefer the button that's actually wired to go somewhere (its href
     // points at a checkout URL) over a text match -- the template's
     // original CTA can still be sitting on the page, unwired, with the same
     // generic text as the button we added and wired, so a bare text match
-    // can click the wrong one.
-    const wiredCta = livePage.locator('a[href*="checkout" i]').first();
+    // can click the wrong one. Excludes "No thanks" for the same reason as
+    // above -- a decline button wired to the same Checkout page can also
+    // have an href*="checkout" and land first in DOM order.
+    const wiredCta = livePage.locator('a[href*="checkout" i]')
+      .filter({ hasNotText: /No,?\s*thanks/i }).first();
     if (await wiredCta.isVisible({ timeout: 8000 }).catch(() => false)) {
       await wiredCta.click();
       Logger.info('BUYER', 'Clicked the wired CTA (checkout-bound link). Transitioning to Checkout...');
@@ -27,9 +46,12 @@ export class PaymentPage {
 
     // Fall back to text matching -- take the LAST match rather than the
     // first, since the button this framework adds is inserted after
-    // whatever the template already has.
-    const ctaByText = livePage.getByRole('link', { name: /Start Free Trial|Join|Buy|Enroll|Order|Get Started/i })
-      .or(livePage.locator('a[href*="checkout"], button:has-text("Buy"), a.btn, [data-gjs-type="link"]')).last();
+    // whatever the template already has. Also excludes "No thanks" for the
+    // same reason as the two matchers above.
+    const ctaByText = livePage.getByRole('link', { name: /Click Here to Get Access|Start Free Trial|Join|Buy|Enroll|Order|Get Started/i })
+      .filter({ hasNotText: /No,?\s*thanks/i })
+      .or(livePage.locator('a[href*="checkout"], button:has-text("Buy"), a.btn, [data-gjs-type="link"]').filter({ hasNotText: /No,?\s*thanks/i }))
+      .last();
 
     await expect(ctaByText).toBeVisible({ timeout: 25000 });
     await ctaByText.click();
@@ -96,6 +118,14 @@ export class PaymentPage {
       .or(stripeFrame.locator('input[name="cardnumber"], input[autocomplete="cc-number"]')).first();
 
     if (await cardNumberInput.isVisible({ timeout: 10000 }).catch(() => false)) {
+      // The card number input rendering doesn't mean the Stripe iframe has
+      // fully finished initializing (fonts/JS/validation wiring) -- filling
+      // too early is a common cause of fields not registering as "valid",
+      // which then makes the submit button silently no-op. Give it a brief
+      // settle window before typing anything.
+      Logger.info('BUYER', 'Stripe card form detected — waiting for it to finish loading...');
+      await livePage.waitForTimeout(1500);
+
       await cardNumberInput.fill('4242424242424242');
 
       const expInput = stripeFrame.getByRole('textbox', { name: /Expiration/i })
@@ -114,7 +144,9 @@ export class PaymentPage {
       }
     }
 
-    await livePage.waitForTimeout(1000);
+    // Let Stripe's own client-side validation catch up with what was just
+    // typed before we try to submit.
+    await livePage.waitForTimeout(1500);
 
     // Scope to the Stripe-specific submit button first (ft-payment-stripe),
     // since a Cashfree submit button can exist on the same page and a bare
@@ -124,8 +156,26 @@ export class PaymentPage {
       .or(livePage.locator('button[type="submit"]:has-text("Pay"), button:has-text("Complete")')).first();
 
     await expect(payBtn).toBeVisible({ timeout: 10000 });
+
+    // Confirmed: this template's "Complete Order" button often needs a
+    // second click to actually submit -- the first click can just settle/
+    // validate the form rather than fire the order. Only fire the second
+    // click if we're still looking at the same submit button afterward
+    // (i.e. the page hasn't already moved on), so a first click that DID
+    // work never gets double-submitted / double-charged.
     await payBtn.click();
-    Logger.info('BUYER', 'Payment submitted! Waiting for order confirmation / upsell routing...');
+    Logger.info('BUYER', 'Clicked "Complete Order" (1/2). Checking if a second click is needed...');
+    await livePage.waitForTimeout(2000);
+
+    const stillOnPayButton = await payBtn.isVisible({ timeout: 3000 }).catch(() => false);
+    if (stillOnPayButton) {
+      await payBtn.click().catch(() => {});
+      Logger.info('BUYER', 'Clicked "Complete Order" (2/2).');
+    } else {
+      Logger.info('BUYER', 'Page already moved on after the first click — skipping the second click to avoid a double charge.');
+    }
+
+    Logger.info('BUYER', 'Payment submitted! Waiting for order confirmation / Thank You page...');
     await livePage.waitForTimeout(5000);
   }
 

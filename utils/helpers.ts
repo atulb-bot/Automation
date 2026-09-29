@@ -111,7 +111,28 @@ export class Helpers {
   ): Promise<void> {
     await trigger.scrollIntoViewIfNeeded().catch(() => {});
     await expect(trigger).toBeVisible({ timeout: 8000 });
-    await trigger.click({ force: true });
+
+    // FIX ("dropdown isn't opening for product selection"): a single click
+    // on the trigger doesn't always register -- in popups that are still
+    // mid fade-in/animation (like the CTA "Go To Next Step" panel), the
+    // first click can land on the backdrop instead of the trigger, or land
+    // before the trigger is actually interactive. Retry the click, checking
+    // each time whether it actually opened something (a focused search
+    // input, or any option-like element rendering), instead of assuming one
+    // click was enough and typing into whatever happened to be focused.
+    let opened = false;
+    for (let attempt = 0; attempt < 3 && !opened; attempt++) {
+      await trigger.click({ force: true });
+      await page.waitForTimeout(attempt === 0 ? 500 : 900);
+      const focusedNow = page.locator(':focus');
+      const anyOption = page.getByRole('option');
+      opened =
+        (await focusedNow.count().catch(() => 0)) > 0 ||
+        (await anyOption.count().catch(() => 0)) > 0;
+    }
+    if (!opened) {
+      Logger.warn('HELPERS', `Product dropdown trigger did not appear to open after 3 attempts -- proceeding anyway in case it opened without a focusable input.`);
+    }
 
     // Whatever the SPA just focused (its live-search input) gets the text --
     // far more reliable than guessing among several candidate <input>s.
@@ -283,4 +304,30 @@ export class Helpers {
     Logger.info('DIAGNOSTIC', `Diagnostic screenshot captured: ${filePath}`);
     return filePath;
   }
+}
+
+
+/**
+ * Generates a random alphabetic string (letters only: a-z, A-Z)
+ */
+export function generateRandomLetters(length: number = 8): string {
+  const letters = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ';
+  let result = '';
+  for (let i = 0; i < length; i++) {
+    result += letters.charAt(Math.floor(Math.random() * letters.length));
+  }
+  return result;
+}
+
+/**
+ * Generates letters-only name and email
+ */
+export function generateLettersOnlyCredentials() {
+  const firstName = 'Atul' + generateRandomLetters(6);
+  const lastName = 'Automation' + generateRandomLetters(6);
+  const fullName = `${firstName} ${lastName}`; // Only letters and standard space
+  const emailPrefix = generateRandomLetters(10).toLowerCase();
+  const email = `${emailPrefix}@flexifunnels.com`;
+
+  return { fullName, email };
 }
