@@ -1,11 +1,29 @@
-<<<<<<< HEAD
-import { Page, expect } from '@playwright/test';
-=======
-import { Page, Locator, FrameLocator, expect } from '@playwright/test';
->>>>>>> 3b74662e3a642703c199e584d84b4d058f47ff14
+import { Page, Locator, FrameLocator } from '@playwright/test';
+import * as fs from 'fs';
+import * as path from 'path';
 import { FREE_TRIAL_SELECTORS } from '../config/selectors';
 
 export type PlanKey = 'launchpad' | 'pro' | 'flexifunnels';
+export type BillingCycle = 'monthly' | 'yearly';
+
+/**
+ * Loose fallback patterns for each plan's "Continue with ..." button.
+ * Only used if the exact text from FREE_TRIAL_SELECTORS.plans is not found,
+ * so the working Pro path is unchanged.
+ */
+const PLAN_BUTTON_PATTERNS: Record<PlanKey, RegExp> = {
+  launchpad: /continue\s*with\s*launch\s*pad/i,
+  pro: /continue\s*with\s*pro\b/i,
+  // The 3rd plan is called "Flexifunnels" in the button but "Premium" on the page/checkout
+  flexifunnels: /continue\s*with\s*(flexi\s*funnels?|premium)/i,
+};
+
+/** "Skip — start trial without a card". Tolerant of em-dash / en-dash / hyphen / no dash. */
+const ADDON_SKIP_PATTERN = /skip\s*[—–-]?\s*start\s+trial\s+without/i;
+
+/** Landing URLs that mean the account + trial were created. */
+const POST_CHECKOUT_URL = /welcome|dashboard/i;
+
 
 export interface CardDetails {
   fullName: string;
@@ -95,77 +113,130 @@ export class FreeTrialPage {
     }
   }
 
-  async selectPlan(plan: PlanKey, billingCycle: 'monthly' | 'yearly' = 'monthly') {
-    // 1. Toggle billing cycle
+  async selectPlan(plan: PlanKey, billingCycle: BillingCycle = 'monthly') {
+    // 1. Billing cycle.
+    //    MONTHLY: click the "Monthly" toggle (the page opens on yearly by default).
+    //    YEARLY : do nothing - the page already shows the yearly plans, and
+    //             clicking around here is what used to risk landing on the wrong view.
     if (billingCycle === 'monthly') {
       const monthlyBtn = this.page.getByRole('button', { name: FREE_TRIAL_SELECTORS.monthlyToggleBtn });
-      if (await monthlyBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
+      const monthlyShown = await monthlyBtn
+        .waitFor({ state: 'visible', timeout: 5000 })
+        .then(() => true)
+        .catch(() => false);
+      if (monthlyShown) {
         await monthlyBtn.click();
         await this.waitStep(1000);
       }
     } else {
-      const yearlyBtn = this.page.getByRole('button', { name: new RegExp(FREE_TRIAL_SELECTORS.yearlyToggleBtn, 'i') });
-      if (await yearlyBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
-        await yearlyBtn.click();
-        await this.waitStep(1000);
-      }
+      console.log('>>> Billing: YEARLY - leaving the default (yearly) plans view untouched.');
     }
 
-    // 2. Click the plan button
-    const planButtonName = FREE_TRIAL_SELECTORS.plans[plan];
-    await this.page.getByRole('button', { name: planButtonName }).click();
+    // 2. Click the plan button (same button as before for Pro; tolerant for other plans)
+    const planButton = await this.findPlanButton(plan);
+    await planButton.scrollIntoViewIfNeeded().catch(() => {});
+    await planButton.click();
+    console.log(`>>> Selected plan: ${plan} (${billingCycle})`);
     await this.waitStep(2000);
 
-    // 3. Click SUBSCRIBE & START TRIAL → (if present)
+    // 3. Click SUBSCRIBE & START TRIAL -> (if present). Real wait, not an instant check.
     const subscribeBtn = this.page.getByRole('button', { name: new RegExp(FREE_TRIAL_SELECTORS.subscribeAndStartTrialBtn, 'i') });
-    if (await subscribeBtn.isVisible({ timeout: 5000 }).catch(() => false)) {
+    const subscribeShown = await subscribeBtn
+      .waitFor({ state: 'visible', timeout: 5000 })
+      .then(() => true)
+      .catch(() => false);
+    if (subscribeShown) {
       await subscribeBtn.click();
       await this.waitStep(3000);
     }
   }
 
   /**
-   * Flow A: Subscribe WITHOUT Card
+   * Flow A: Free trial WITHOUT Card - matches the recorded flow, strictly in order:
+   *   1. "Skip — start trial without a card" link (clicked ONCE)
+   *   2. "Skip plan selection" pop-up -> "Skip for now"   (pop-up is slow to load, waits up to 45s)
+   *   3. "START MY FREE TRIAL →"
+   *
+   * No plan is selected and SUBSCRIBE is never clicked (that opens the Paddle ZIP/card screen).
+   * The skip link stays visible behind the pop-up, so it is never clicked again once the
+   * pop-up is on its way - that was what stopped "Skip for now" from being clicked.
    */
   async completeTrialWithoutCard() {
-    const skipAddonBtn = this.page.getByRole('button', { name: new RegExp(FREE_TRIAL_SELECTORS.skipTrialWithoutAddonBtn, 'i') });
-    await skipAddonBtn.waitFor({ state: 'visible', timeout: 10000 });
-    await skipAddonBtn.click();
-    await this.waitStep();
+    const skipLink = () => this.firstVisible(ADDON_SKIP_PATTERN);
+    const skipForNow = this.page.getByRole('button', { name: /^\s*skip\s*for\s*now\s*$/i }).first();
 
-    const skipForNowBtn = this.page.getByRole('button', { name: FREE_TRIAL_SELECTORS.skipForNowBtn });
-    await skipForNowBtn.waitFor({ state: 'visible', timeout: 8000 });
-    await skipForNowBtn.click();
-    await this.waitStep();
+    // ── Step 1: "Skip — start trial without a card" (once; one retry only if the pop-up never came)
+    const link = await this.waitForVisible(ADDON_SKIP_PATTERN, 30000);
+    if (!link) {
+      await this.dumpDiagnostics('nocard-skip-link-missing');
+      throw new Error('No-card flow: "Skip — start trial without a card" link did not appear on the plans page.');
+    }
+    await link.scrollIntoViewIfNeeded().catch(() => {});
+    console.log('>>> No-card flow: clicking "Skip — start trial without a card"');
+    await link.click();
 
-    const startTrialBtn = this.page.getByRole('button', { name: FREE_TRIAL_SELECTORS.startMyFreeTrialBtn });
-    await startTrialBtn.waitFor({ state: 'visible', timeout: 8000 });
-    await startTrialBtn.click();
+    // ── Step 2: wait for the slow "Skip plan selection" pop-up, then "Skip for now"
+    console.log('>>> No-card flow: waiting for the "Skip plan selection" pop-up (can be slow)...');
+    let popupShown = await skipForNow.waitFor({ state: 'visible', timeout: 45000 }).then(() => true).catch(() => false);
+
+    if (!popupShown) {
+      // Pop-up never showed: the first click probably did not register. Retry the link ONCE.
+      const again = await skipLink();
+      if (again) {
+        console.log('>>> No-card flow: pop-up did not appear - clicking the skip link one more time.');
+        await again.click().catch(() => {});
+        popupShown = await skipForNow.waitFor({ state: 'visible', timeout: 30000 }).then(() => true).catch(() => false);
+      }
+    }
+    if (!popupShown) {
+      await this.assertNoPaddle();
+      await this.dumpDiagnostics('nocard-skip-for-now-missing');
+      throw new Error('No-card flow: the "Skip plan selection" pop-up ("Skip for now") did not appear.');
+    }
+
+    await this.waitStep(800); // let the pop-up finish its open animation
+    console.log('>>> No-card flow: clicking "Skip for now"');
+    await skipForNow.click();
+
+    // ── Step 3: "START MY FREE TRIAL →"
+    const start = await this.waitForVisible(/start\s*my\s*free\s*trial/i, 45000);
+    if (!start) {
+      if (POST_CHECKOUT_URL.test(this.page.url())) return; // already moved on
+      await this.assertNoPaddle();
+      await this.dumpDiagnostics('nocard-start-trial-missing');
+      throw new Error('No-card flow: "START MY FREE TRIAL" button did not appear after "Skip for now".');
+    }
+    console.log('>>> No-card flow: clicking "START MY FREE TRIAL"');
+    await start.click();
     await this.waitStep(3000);
   }
 
-<<<<<<< HEAD
+  /** Fails fast with a clear message if the Paddle card/ZIP checkout opened during a no-card run. */
+  private async assertNoPaddle() {
+    if (await this.page.locator(FREE_TRIAL_SELECTORS.paddleFrame).first().isVisible().catch(() => false)) {
+      await this.dumpDiagnostics('nocard-paddle-opened');
+      throw new Error('No-card flow: the Paddle card/ZIP checkout opened, which should not happen for a no-card trial.');
+    }
+  }
+
   /**
    * Flow B: Subscribe WITH Card (Paddle checkout iframe)
    */
   async completeTrialWithCard(card: CardDetails) {
     const paddleFrame = this.page.frameLocator(FREE_TRIAL_SELECTORS.paddleFrame);
 
-    // 1. Postcode
-    const postCode = paddleFrame.getByTestId(FREE_TRIAL_SELECTORS.postcodeInput);
-    await postCode.waitFor({ state: 'visible', timeout: 15000 });
-    await postCode.click();
-    await postCode.fill(card.postalCode || '1234560');
-    await this.waitStep(500);
+    // NOTE: "Skip — start trial without a..." is the NO-CARD button on the plans page,
+    // so the card flow must never click it. We go straight to the Paddle checkout.
 
-    // 2. Submit location
-    const locationBtn = paddleFrame.getByTestId(FREE_TRIAL_SELECTORS.authLocationSubmitBtn);
-    await locationBtn.waitFor({ state: 'visible', timeout: 10000 });
-    await locationBtn.click();
-    await this.waitStep(2500);
+    // 1. Postcode (Paddle "Your details" step)
+    const postCode = await this.resolvePostcodeField(paddleFrame);
+    const cardNumber = paddleFrame.getByTestId(FREE_TRIAL_SELECTORS.cardNumberInput);
+
+    // 2. Submit location (ZIP). Never hangs: every click and wait has a time limit, and it
+    //    moves on to valid 6-digit Indian PIN codes if Paddle does not accept the first ZIP.
+    await this.submitZipUntilCardFields(paddleFrame, postCode, cardNumber, card.postalCode || '1234560');
 
     // 3. Card details
-    const cardNumber = paddleFrame.getByTestId(FREE_TRIAL_SELECTORS.cardNumberInput);
     await cardNumber.waitFor({ state: 'visible', timeout: 15000 });
     await cardNumber.click();
     await cardNumber.fill(card.cardNumber || '4242 4242 4242 4242');
@@ -190,176 +261,268 @@ export class FreeTrialPage {
     const submitPaymentBtn = paddleFrame.getByTestId(FREE_TRIAL_SELECTORS.cardPaymentSubmitBtn);
     await submitPaymentBtn.click();
     await this.waitStep(5000);
-=======
-  // ---------------------------------------------------------------------------
-  // Flow B: Subscribe WITH Card (Paddle checkout iframe)
-  // ---------------------------------------------------------------------------
-
-  /** The visible Paddle checkout iframe (there can be hidden leftovers in the DOM). */
-  private paddle(): FrameLocator {
-    return this.page
-      .locator(FREE_TRIAL_SELECTORS.paddleFrame)
-      .filter({ visible: true })
-      .last()
-      .contentFrame();
   }
 
   /**
-   * Pincode field. Paddle does not always render it the same way: for Pro it is
-   * on the first "location" step with test-id `postcodeInput`, for other plans
-   * it can appear on the card step or with a different id/label. So we match
-   * every known variant and take whichever is on screen.
+   * After payment / trial start: get past the welcome screen, close pop-ups and return,
+   * so the next test in the queue can start.
+   *
+   * Every wait here is a REAL, bounded wait (Playwright's isVisible({timeout}) ignores its
+   * timeout and returns instantly). The last step only fails if we are clearly back on the
+   * login/register screen; it no longer hangs waiting for one specific URL.
    */
-  private postcodeField(frame: FrameLocator): Locator {
-    return frame
-      .getByTestId(FREE_TRIAL_SELECTORS.postcodeInput)
-      .or(frame.locator(FREE_TRIAL_SELECTORS.postcodeCssFallback))
-      .or(frame.getByLabel(FREE_TRIAL_SELECTORS.postcodeLabel))
-      .or(frame.getByPlaceholder(FREE_TRIAL_SELECTORS.postcodeLabel))
-      .filter({ visible: true })
+  async finishOnboarding() {
+    // 1. Wait (max 45s) until we have left the plan / Paddle screens
+    const leaveDeadline = Date.now() + 45000;
+    while (Date.now() < leaveDeadline) {
+      if (POST_CHECKOUT_URL.test(this.page.url())) break;
+      if (await this.hasLeftCheckout()) break;
+      await this.page.waitForTimeout(1000);
+    }
+    await this.waitStep();
+
+    // 2. "Continue to dashboard" (wait up to 15s)
+    const toDashboard = await this.waitForVisible(/continue\s*to\s*dashboard/i, 15000);
+    if (toDashboard) {
+      await toDashboard.click();
+      await this.waitStep();
+    }
+
+    // 3. Close any welcome / onboarding pop-ups
+    await this.closeOnboardingPopups();
+
+    // 4. Done - the account exists. Only fail if we were bounced back to login/register.
+    const finalUrl = this.page.url();
+    console.log(`>>> Onboarding finished. Final URL: ${finalUrl}`);
+    if (/new-login|register|signup/i.test(finalUrl)) {
+      await this.dumpDiagnostics('onboarding-bad-url');
+      throw new Error(`Expected to be inside the app after onboarding but landed on: ${finalUrl}`);
+    }
+  }
+
+  // ───────────────────────── helpers for multi-plan support ─────────────────────────
+
+  /**
+   * Returns the first VISIBLE "Continue with <plan>" button.
+   * 1st try = the exact selector used before (so Pro behaves identically),
+   * then looser fallbacks for plans whose button text/markup differs.
+   */
+  private async findPlanButton(plan: PlanKey): Promise<Locator> {
+    const pattern = PLAN_BUTTON_PATTERNS[plan];
+
+    // Wait for the plans screen to render at least one plan button
+    await this.page
+      .getByRole('button', { name: /continue\s*with/i })
+      .first()
+      .waitFor({ state: 'visible', timeout: 20000 })
+      .catch(() => {});
+
+    const candidates: Locator[] = [
+      this.page.getByRole('button', { name: FREE_TRIAL_SELECTORS.plans[plan] }),
+      this.page.getByRole('button', { name: pattern }),
+      this.page.getByRole('link', { name: pattern }),
+      this.page.locator('button, a, [role="button"]').filter({ hasText: pattern }),
+    ];
+
+    for (const candidate of candidates) {
+      const count = await candidate.count().catch(() => 0);
+      for (let i = 0; i < count; i++) {
+        const el = candidate.nth(i);
+        if (await el.isVisible().catch(() => false)) return el;
+      }
+    }
+
+    await this.dumpDiagnostics(`plan-button-${plan}`);
+    throw new Error(`Could not find a visible "Continue with ${plan}" button. See screenshot + button list above.`);
+  }
+
+  /** First visible button/link whose text matches the pattern, or null (no waiting). */
+  private async firstVisible(pattern: RegExp): Promise<Locator | null> {
+    const strategies: Locator[] = [
+      this.page.getByRole('button', { name: pattern }),
+      this.page.getByRole('link', { name: pattern }),
+      this.page.locator('button, a, [role="button"]').filter({ hasText: pattern }),
+    ];
+    for (const loc of strategies) {
+      const n = await loc.count().catch(() => 0);
+      for (let i = 0; i < n; i++) {
+        const el = loc.nth(i);
+        if (await el.isVisible().catch(() => false)) return el;
+      }
+    }
+    return null;
+  }
+
+  /** Polls up to timeoutMs for a matching visible button/link. */
+  private async waitForVisible(pattern: RegExp, timeoutMs: number): Promise<Locator | null> {
+    const end = Date.now() + timeoutMs;
+    do {
+      const el = await this.firstVisible(pattern);
+      if (el) return el;
+      await this.page.waitForTimeout(400);
+    } while (Date.now() < end);
+    return null;
+  }
+
+  /** True when neither the Paddle overlay nor the "Continue with <plan>" buttons are on screen. */
+  private async hasLeftCheckout(): Promise<boolean> {
+    const paddleVisible = await this.page.locator(FREE_TRIAL_SELECTORS.paddleFrame).first().isVisible().catch(() => false);
+    if (paddleVisible) return false;
+    const planButton = await this.firstVisible(/continue\s*with/i);
+    return planButton === null;
+  }
+
+  /** Closes up to 4 stacked welcome / onboarding pop-ups. */
+  private async closeOnboardingPopups() {
+    for (let pass = 0; pass < 4; pass++) {
+      const candidates: Locator[] = [
+        this.page.getByRole('button', { name: FREE_TRIAL_SELECTORS.closeBtn }).first(),
+        this.page.locator('div').filter({ hasText: /^Close$/ }).first(),
+      ];
+      let closed = false;
+      for (const candidate of candidates) {
+        const visible = await candidate
+          .waitFor({ state: 'visible', timeout: pass === 0 ? 5000 : 2000 })
+          .then(() => true)
+          .catch(() => false);
+        if (visible) {
+          await candidate.click().catch(() => {});
+          await this.waitStep();
+          closed = true;
+          break;
+        }
+      }
+      if (!closed) break;
+    }
+  }
+
+  /**
+   * Paddle ZIP field. Tries the known test id first (identical to before),
+   * then falls back to label / autocomplete based locators.
+   */
+  private async resolvePostcodeField(frame: FrameLocator): Promise<Locator> {
+    const byTestId = frame.getByTestId(FREE_TRIAL_SELECTORS.postcodeInput);
+    if (await byTestId.waitFor({ state: 'visible', timeout: 15000 }).then(() => true).catch(() => false)) {
+      return byTestId;
+    }
+    const fallback = frame
+      .getByLabel(/zip|post\s*code/i)
+      .or(frame.locator('input[autocomplete="postal-code"], input[name*="postcode" i], input[name*="zip" i]'))
       .first();
+    if (await fallback.waitFor({ state: 'visible', timeout: 8000 }).then(() => true).catch(() => false)) {
+      console.log('>>> ZIP field found via fallback locator (test id not present).');
+      return fallback;
+    }
+    await this.dumpDiagnostics('paddle-not-shown');
+    throw new Error('Paddle checkout (ZIP/postcode field) did not appear after selecting the plan. See screenshot + frame/button list above.');
   }
 
-  /** Types a value like a real user (masked Paddle inputs sometimes ignore .fill()). */
-  private async typeInto(field: Locator, value: string) {
-    await field.click();
-    await field.fill('');
-    await field.pressSequentially(value, { delay: 60 });
-    const typed = (await field.inputValue().catch(() => '')).replace(/\s/g, '');
-    if (typed !== value.replace(/\s/g, '')) {
-      await field.fill(value);
+  /**
+   * Tries each ZIP until Paddle shows the card fields.
+   * Order: configured ZIP first (unchanged behaviour when it works), then valid 6-digit PINs.
+   */
+  private async submitZipUntilCardFields(frame: FrameLocator, postCode: Locator, cardNumber: Locator, firstZip: string) {
+    const zips = [...new Set([firstZip, '248001', '110001'])];
+
+    for (let i = 0; i < zips.length; i++) {
+      const zip = zips[i];
+      console.log(`>>> Paddle: entering ZIP/PIN "${zip}" (attempt ${i + 1}/${zips.length})`);
+      const submitted = await this.submitPaddleLocation(frame, postCode, zip);
+      if (!submitted) continue; // Continue was disabled for this ZIP - try the next one now
+
+      // Wait up to 30s for card fields (Paddle can be slow calculating tax on yearly plans)
+      const end = Date.now() + 30000;
+      while (Date.now() < end) {
+        if (await cardNumber.isVisible().catch(() => false)) {
+          console.log(`>>> Paddle: ZIP "${zip}" accepted - card fields are showing.`);
+          return;
+        }
+        const errText = await this.paddleErrorText(frame);
+        if (errText) {
+          console.log(`>>> Paddle: ZIP "${zip}" rejected - "${errText}"`);
+          break;
+        }
+        await this.page.waitForTimeout(1000);
+      }
+      if (await cardNumber.isVisible().catch(() => false)) return;
+      if (!(await postCode.isVisible().catch(() => false))) {
+        // Left the ZIP step but no card fields yet - give it a little longer, then stop.
+        if (await cardNumber.waitFor({ state: 'visible', timeout: 15000 }).then(() => true).catch(() => false)) return;
+        break;
+      }
     }
+
+    await this.dumpDiagnostics('paddle-zip-stuck');
+    throw new Error('Paddle did not move from the ZIP/Postcode step to the card details step. See screenshot + Paddle text above.');
   }
 
-  /** Fills the pincode if the field is currently shown. Returns true if it filled it. */
-  private async fillPostcodeIfShown(frame: FrameLocator, postcode: string, timeoutMs = 3000): Promise<boolean> {
-    const field = this.postcodeField(frame);
-    if (!(await field.isVisible({ timeout: timeoutMs }).catch(() => false))) return false;
-
-    const current = (await field.inputValue().catch(() => '')).trim();
-    if (current === postcode) {
-      console.log(`[free-trial] Pincode already filled (${postcode}).`);
-      return true;
+  /** Visible validation error inside the Paddle frame, if any. */
+  private async paddleErrorText(frame: FrameLocator): Promise<string | null> {
+    const err = frame.locator('[role="alert"], [aria-invalid="true"] ~ *, [class*="error" i]').filter({ hasText: /\S/ }).first();
+    if (await err.isVisible().catch(() => false)) {
+      return ((await err.innerText({ timeout: 2000 }).catch(() => '')) || '').replace(/\s+/g, ' ').trim().slice(0, 120) || null;
     }
-    await this.typeInto(field, postcode);
-    console.log(`[free-trial] Pincode filled: ${postcode}`);
-    await this.waitStep(500);
+    return null;
+  }
+
+  /** Types the ZIP and presses Paddle's "Continue" on the "Your details" step (time-limited). */
+  private async submitPaddleLocation(frame: FrameLocator, postCode: Locator, zip: string): Promise<boolean> {
+    await postCode.click({ timeout: 10000 });
+    await postCode.fill('', { timeout: 10000 });
+    await postCode.fill(zip, { timeout: 10000 });
+    // If Paddle's field did not take the value (e.g. maxlength / masked input), type it key by key
+    const typed = await postCode.inputValue({ timeout: 5000 }).catch(() => '');
+    if (typed !== zip) {
+      await postCode.fill('', { timeout: 10000 }).catch(() => {});
+      await postCode.pressSequentially(zip, { delay: 80, timeout: 15000 }).catch(() => {});
+    }
+    await postCode.press('Tab', { timeout: 5000 }).catch(() => {}); // trigger Paddle validation
+    await this.waitStep(800);
+    console.log(`>>> Paddle: ZIP field now contains "${await postCode.inputValue({ timeout: 5000 }).catch(() => '?')}"`);
+
+    let locationBtn: Locator = frame.getByTestId(FREE_TRIAL_SELECTORS.authLocationSubmitBtn);
+    if (!(await locationBtn.waitFor({ state: 'visible', timeout: 10000 }).then(() => true).catch(() => false))) {
+      locationBtn = frame.getByRole('button', { name: /^continue$/i }).first();
+      await locationBtn.waitFor({ state: 'visible', timeout: 5000 }).catch(() => {});
+    }
+    if (!(await locationBtn.isEnabled().catch(() => true))) {
+      console.log('>>> Paddle: Continue button is disabled for this ZIP.');
+      return false;
+    }
+    await locationBtn.click({ timeout: 15000 }).catch((e) => console.log(`>>> Paddle: Continue click failed: ${String(e).split('\n')[0]}`));
+    await this.waitStep(2500);
     return true;
   }
 
-  /**
-   * Some plans show an extra "how do you want to start your trial" screen before
-   * Paddle opens. If Paddle is not already open, try the card/continue buttons.
-   */
-  private async ensurePaddleOpen() {
-    const frameEl = this.page.locator(FREE_TRIAL_SELECTORS.paddleFrame).filter({ visible: true }).last();
-    if (await frameEl.isVisible({ timeout: 15000 }).catch(() => false)) return;
+  /** Saves a screenshot and prints all visible button labels, to debug a failing step. */
+  private async dumpDiagnostics(tag: string) {
+    try {
+      const dir = path.join(__dirname, '../test-results');
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+      const file = path.join(dir, `freetrial-${tag}-${Date.now()}.png`);
+      await this.page.screenshot({ path: file, fullPage: true });
+      console.log(`>>> [DIAGNOSTIC] Screenshot saved: ${file}`);
 
-    const cardChoice = this.page
-      .getByRole('button', { name: FREE_TRIAL_SELECTORS.addCardChoiceBtn })
-      .filter({ visible: true })
-      .first();
-    if (await cardChoice.isVisible({ timeout: 3000 }).catch(() => false)) {
-      console.log('[free-trial] Clicking card option to open Paddle checkout.');
-      await cardChoice.click();
-    }
-
-    if (!(await frameEl.isVisible({ timeout: 20000 }).catch(() => false))) {
-      await this.page.screenshot({ path: 'test-results/paddle-not-opened.png', fullPage: true }).catch(() => {});
-      const buttons = await this.page.getByRole('button').filter({ visible: true }).allInnerTexts().catch(() => []);
-      throw new Error(
-        'Paddle checkout did not open. Screenshot: test-results/paddle-not-opened.png\n' +
-          'Buttons on screen: ' + buttons.map((b) => b.trim()).filter(Boolean).join(' | '),
+      const labels = await this.page.evaluate(() =>
+        Array.from(document.querySelectorAll('button, a, [role="button"]'))
+          .filter((el) => {
+            const r = (el as HTMLElement).getBoundingClientRect();
+            return r.width > 0 && r.height > 0;
+          })
+          .map((el) => (el.textContent || '').replace(/\s+/g, ' ').trim())
+          .filter((t) => t.length > 0 && t.length < 80)
       );
+      console.log(`>>> [DIAGNOSTIC] URL: ${this.page.url()}`);
+      console.log('>>> [DIAGNOSTIC] Frames: ' + this.page.frames().map((f) => `${f.name() || '(no name)'} -> ${f.url().slice(0, 80)}`).join(' | '));
+      const paddleText = await this.page
+        .frameLocator(FREE_TRIAL_SELECTORS.paddleFrame)
+        .locator('body')
+        .innerText({ timeout: 3000 })
+        .catch(() => '');
+      if (paddleText) console.log('>>> [DIAGNOSTIC] Paddle checkout text:\n  ' + paddleText.replace(/\n+/g, ' | ').slice(0, 600));
+      console.log('>>> [DIAGNOSTIC] Visible buttons/links:\n  - ' + [...new Set(labels)].join('\n  - '));
+    } catch (e) {
+      console.log('>>> [DIAGNOSTIC] Could not capture diagnostics:', e);
     }
-  }
-
-  async completeTrialWithCard(card: CardDetails) {
-    const postcode = card.postalCode || FREE_TRIAL_SELECTORS.defaultPostcode;
-
-    await this.ensurePaddleOpen();
-    const frame = this.paddle();
-
-    const cardNumber = frame.getByTestId(FREE_TRIAL_SELECTORS.cardNumberInput);
-    const locationBtn = frame.getByTestId(FREE_TRIAL_SELECTORS.authLocationSubmitBtn);
-
-    // 1. Wait until Paddle has rendered its first step (location step OR card step).
-    await this.postcodeField(frame).or(locationBtn).or(cardNumber).first()
-      .waitFor({ state: 'visible', timeout: 30000 });
-    await this.waitStep(800);
-
-    // 2. Location step (Pro shows pincode here; other plans may not have this step).
-    let postcodeDone = await this.fillPostcodeIfShown(frame, postcode);
-    if (await locationBtn.isVisible({ timeout: 2000 }).catch(() => false)) {
-      await locationBtn.click();
-      await this.waitStep(2500);
-
-      // Still on location step? Pincode was required but missing/rejected.
-      if (!(await cardNumber.isVisible({ timeout: 15000 }).catch(() => false))) {
-        postcodeDone = (await this.fillPostcodeIfShown(frame, postcode)) || postcodeDone;
-        await locationBtn.click();
-        await this.waitStep(2500);
-      }
-    }
-
-    // 3. Card details.
-    await cardNumber.waitFor({ state: 'visible', timeout: 20000 });
-    await this.typeInto(cardNumber, card.cardNumber || '4242 4242 4242 4242');
-    await this.waitStep(500);
-
-    await this.typeInto(frame.getByTestId(FREE_TRIAL_SELECTORS.cardholderNameInput), card.fullName);
-    await this.waitStep(500);
-
-    await this.typeInto(frame.getByTestId(FREE_TRIAL_SELECTORS.expiryDateField), card.expiry || '03 / 33');
-    await this.waitStep(500);
-
-    await this.typeInto(frame.getByTestId(FREE_TRIAL_SELECTORS.cvvInput), card.cvv || '258');
-    await this.waitStep(500);
-
-    // 4. For LaunchPad / FlexiFunnels the pincode can show up here, on the card step.
-    postcodeDone = (await this.fillPostcodeIfShown(frame, postcode, 2000)) || postcodeDone;
-    if (!postcodeDone) {
-      console.log('[free-trial] No pincode field was shown by Paddle for this plan.');
-    }
-
-    // 5. Submit payment.
-    const submitPaymentBtn = frame.getByTestId(FREE_TRIAL_SELECTORS.cardPaymentSubmitBtn);
-    await submitPaymentBtn.click();
-    await this.waitStep(5000);
-
-    // 6. If Paddle is still showing the form with an empty pincode, fill it and retry once.
-    if (await submitPaymentBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
-      if (await this.fillPostcodeIfShown(frame, postcode, 2000)) {
-        console.log('[free-trial] Paddle asked for pincode again after submit - retrying payment.');
-        await submitPaymentBtn.click();
-        await this.waitStep(5000);
-      }
-    }
->>>>>>> 3b74662e3a642703c199e584d84b4d058f47ff14
-  }
-
-  async finishOnboarding() {
-    await this.page.waitForURL(/.*welcome|dashboard.*/, { timeout: 35000 }).catch(() => {});
-    await this.waitStep();
-
-    const continueToDashboard = this.page.getByRole('link', { name: FREE_TRIAL_SELECTORS.continueToDashboardLink });
-    if (await continueToDashboard.isVisible({ timeout: 15000 }).catch(() => false)) {
-      await continueToDashboard.click();
-      await this.waitStep();
-    }
-
-    const closeBtn = this.page.getByRole('button', { name: FREE_TRIAL_SELECTORS.closeBtn }).first();
-    if (await closeBtn.isVisible({ timeout: 5000 }).catch(() => false)) {
-      await closeBtn.click();
-      await this.waitStep();
-    }
-
-    const closeDiv = this.page.locator('div').filter({ hasText: /^Close$/ }).first();
-    if (await closeDiv.isVisible({ timeout: 3000 }).catch(() => false)) {
-      await closeDiv.click();
-      await this.waitStep();
-    }
-
-    await expect(this.page).toHaveURL(/.*dashboard|welcome.*/);
   }
 }

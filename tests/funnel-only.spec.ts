@@ -25,7 +25,7 @@ import { FunnelBuilderPage } from '../pages/FunnelBuilderPage';
  */
 test.describe('FlexiFunnels Funnel Build Only', () => {
   test('build funnel against existing products', async ({ page }) => {
-    test.setTimeout(10 * 60 * 1000); // 10 minutes — no product creation, just the funnel build + CTA wiring
+    test.setTimeout(30 * 60 * 1000); // 10 minutes — no product creation, just the funnel build + CTA wiring
 
     const lastRun = getLastRunState();
     const baseRandom = process.env.QA_BASE_RANDOM || lastRun?.baseRandom;

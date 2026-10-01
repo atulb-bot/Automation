@@ -2,6 +2,7 @@ import { Page, expect } from '@playwright/test';
 import { Logger } from '../utils/logger';
 import { PopupHandler } from '../utils/popup-handler';
 import { TestContext } from '../utils/test-context';
+import { saveEditorPage } from '../utils/editor-save';
 
 export class CheckoutPage {
   constructor(private page: Page, private context: TestContext) {}
@@ -58,6 +59,7 @@ export class CheckoutPage {
     this.context.recordStep('Publish Checkout Page');
     Logger.info('CHECKOUT', 'Publishing checkout page...');
 
+    await saveEditorPage(this.page); // Save first (keeps buttons / wiring / forms), then Publish
     await this.page.getByRole('button', { name: 'Publish Publish the page live.' }).click();
     await this.page.waitForTimeout(3000);
     Logger.info('CHECKOUT', 'CHECKOUT PAGE UPDATED & PUBLISHED');

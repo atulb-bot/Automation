@@ -4,6 +4,7 @@ import * as fs from 'fs';
 import { Logger } from './logger';
 import { PopupHandler } from './popup-handler';
 import { TestContext } from './test-context';
+import { ME } from './my-details';
 
 export class Helpers {
   /**
@@ -323,7 +324,7 @@ export function generateRandomLetters(length: number = 8): string {
  * Generates letters-only name and email
  */
 export function generateLettersOnlyCredentials() {
-  const firstName = 'Atul' + generateRandomLetters(6);
+  const firstName = ME.firstName + generateRandomLetters(6);
   const lastName = 'Automation' + generateRandomLetters(6);
   const fullName = `${firstName} ${lastName}`; // Only letters and standard space
   const emailPrefix = generateRandomLetters(10).toLowerCase();

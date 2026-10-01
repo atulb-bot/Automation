@@ -1,5 +1,6 @@
 import * as fs from 'fs';
 import * as path from 'path';
+import { testEmail } from './my-details';
 
 export interface RunState {
   projectName: string;
@@ -61,5 +62,5 @@ export function generateStepProductName(baseRandom: string, step: 'FE' | 'OTO1' 
 
 export function generateCustomerEmail(): string {
   const randomSuffix = generateAlphaNumericId(6).toLowerCase();
-  return `atul.b+${randomSuffix}@flexifunnels.com`;
+  return testEmail(randomSuffix);
 }

@@ -1,0 +1,9 @@
+{
+  "_help": "Your own details. Each team member edits this file (or Dashboard -> Settings -> My details). It is not shared through git.",
+  "loginEmail": "testingflexifunnels@gmail.com",
+  "testEmail": "atul.b@flexifunnels.com",
+  "firstName": "Tester",
+  "phone": "1234567890",
+  "city": "Dehradun",
+  "loginPassword": "Flexi@123#"
+}

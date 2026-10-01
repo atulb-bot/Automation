@@ -2,9 +2,13 @@ import { Page, expect } from '@playwright/test';
 import { Logger } from '../utils/logger';
 import { PopupHandler } from '../utils/popup-handler';
 import { TestContext } from '../utils/test-context';
+import { waitForManualStep } from '../utils/manual-assist';
+import { saveEditorPage } from '../utils/editor-save';
 
 export interface PageSpec {
   name: string;
+  /** Always start this page from "Blank Template" (e.g. the split-test Variant opt-in page). */
+  blankTemplate?: boolean;
   /** Exact visible text of the page-type option inside #page-type-menu (confirmed via recording). Kept for logging/back-compat. */
   typeTextMatch: string;
   /**
@@ -45,7 +49,40 @@ export class FunnelPage {
     { name: 'Thank You', typeTextMatch: 'Thank You (Purchase)', typeMatchPattern: /Thank You|Shown after successful/i, tabLabel: 'Thank You', hasInlineTemplateGallery: true, publishAsButtonName: 'Publish as Thank You (' },
   ];
 
+  /** A page with exactly this name already in the project's page list? */
+  private async pageExists(name: string, waitMs = 1500): Promise<boolean> {
+    const row = this.page.getByText(name, { exact: true }).first();
+    return row.waitFor({ state: 'visible', timeout: waitMs }).then(() => true).catch(() => false);
+  }
+
+  /**
+   * Creates one page. Skips it if it already exists (e.g. you made it by hand); if creating it fails,
+   * asks you to make it by hand and continues once it shows up in the page list.
+   */
   public async createSinglePage(spec: PageSpec, index: number): Promise<void> {
+    if (await this.pageExists(spec.name)) {
+      Logger.info('FUNNEL', `[${index + 1}/${FunnelPage.FUNNEL_PAGES.length}] "${spec.name}" already exists - skipping.`);
+      return;
+    }
+    try {
+      await this.createSinglePageSteps(spec, index);
+    } catch (err) {
+      const reason = String(err instanceof Error ? err.message : err).split('\n')[0];
+      Logger.warn('FUNNEL', `Creating "${spec.name}" failed: ${reason}`);
+      await this.page.keyboard.press('Escape').catch(() => {});
+      const kind = /Sales Page/i.test(spec.typeTextMatch) ? 'Sales Page, Blank Template' : /Checkout/i.test(spec.typeTextMatch) ? 'Checkout Page' : 'Thank You (Purchase), any template, then Publish';
+      const done = await waitForManualStep(this.page, `Create the page "${spec.name}"`,
+        `In the project: Add New Page -> name "${spec.name}" -> type ${kind}. Then come back to the page list.`,
+        async () => {
+          if (this.context.projectUrl && !this.page.url().startsWith(this.context.projectUrl)) return false;
+          return this.pageExists(spec.name, 500);
+        });
+      if (!done) throw err;
+      if (this.context.projectUrl) await this.page.goto(this.context.projectUrl, { waitUntil: 'domcontentloaded' }).catch(() => {});
+    }
+  }
+
+  private async createSinglePageSteps(spec: PageSpec, index: number): Promise<void> {
     this.context.recordStep(`Create Page: ${spec.name}`);
     Logger.info('FUNNEL', `[${index + 1}/${FunnelPage.FUNNEL_PAGES.length}] Creating page: "${spec.name}"...`);
 
@@ -54,12 +91,18 @@ export class FunnelPage {
 
     // 1. Click "+ Add New Page"
     const addBtn = this.page.getByRole('button', { name: 'Add New Page' }).first();
-    await expect(addBtn).toBeVisible({ timeout: 25000 });
+    if (!(await addBtn.waitFor({ state: 'visible', timeout: 20000 }).then(() => true).catch(() => false))) {
+      // e.g. the app stayed inside the page just created - go back to the project's page list
+      Logger.warn('FUNNEL', `"Add New Page" not showing before "${spec.name}" - going back to the project page list.`);
+      if (this.context.projectUrl) await this.page.goto(this.context.projectUrl, { waitUntil: 'domcontentloaded' });
+      await PopupHandler.dismissKnownPopups(this.page);
+    }
+    await expect(addBtn, `"Add New Page" button (before creating "${spec.name}")`).toBeVisible({ timeout: 30000 });
     await addBtn.click();
 
     // 2. Fill Page Name (confirmed: role textbox, accessible name "Enter Page name")
     const nameInput = this.page.getByRole('textbox', { name: 'Enter Page name' });
-    await expect(nameInput).toBeVisible({ timeout: 10000 });
+    await expect(nameInput, `page name box for "${spec.name}"`).toBeVisible({ timeout: 15000 });
     await nameInput.click();
     await nameInput.fill(spec.name);
 
@@ -81,9 +124,16 @@ export class FunnelPage {
     await expect(addPageBtn).toBeHidden({ timeout: 15000 }).catch(() => {});
     Logger.info('FUNNEL', `Page "${spec.name}" registered.`);
 
+    // Default (blank pages): sales pages start from "Blank Template"; their content (section, 2-column row,
+    // "Sales FE" headline, button, No thanks) is built later in the wiring step.
+    if (spec.blankTemplate || (process.env.PAGE_MODE !== 'template' && /Sales Page/i.test(spec.typeTextMatch))) {
+      await this.selectBlankTemplate(spec.name);
+      return;
+    }
+
     if (spec.hasInlineTemplateGallery) {
       // 6. Template gallery appears immediately for Sales / Thank You pages.
-      const galleryVisible = await this.page.getByText('Choose a Template').isVisible({ timeout: 20000 }).catch(() => false);
+      const galleryVisible = await this.page.getByText('Choose a Template').waitFor({ state: 'visible', timeout: 20000 }).then(() => true).catch(() => false);
       if (galleryVisible) {
         await this.selectRandomTemplate(spec.name, spec.tabLabel);
       } else {
@@ -136,7 +186,7 @@ export class FunnelPage {
       }
 
       await typeDropdown.click();
-      const menuOpened = await typeMenu.isVisible({ timeout: 8000 }).catch(() => false);
+      const menuOpened = await typeMenu.waitFor({ state: 'visible', timeout: 8000 }).then(() => true).catch(() => false);
       if (!menuOpened) {
         Logger.warn('FUNNEL', `Page-type menu did not open (attempt ${attempt}/3) for "${spec.name}" — retrying.`);
         continue;
@@ -147,7 +197,7 @@ export class FunnelPage {
         .locator('li, [role="option"], div[class*="cursor-pointer" i], button')
         .filter({ hasText: spec.typeMatchPattern })
         .first();
-      const optionVisible = await typeOption.isVisible({ timeout: 5000 }).catch(() => false);
+      const optionVisible = await typeOption.waitFor({ state: 'visible', timeout: 5000 }).then(() => true).catch(() => false);
       if (!optionVisible) {
         Logger.warn('FUNNEL', `No option matching "${spec.typeTextMatch}" found in the page-type menu (attempt ${attempt}/3) for "${spec.name}" — retrying.`);
         await this.page.keyboard.press('Escape').catch(() => {});
@@ -169,19 +219,61 @@ export class FunnelPage {
     Logger.warn('FUNNEL', `Could not confirm page type "${spec.typeTextMatch}" was applied for "${spec.name}" after 3 attempts — "Add Page" may stay disabled or create the wrong type.`);
   }
 
+  /** Recorded: "Blank Template - Start from..." -> Select. */
+  private async selectBlankTemplate(pageName: string): Promise<void> {
+    await PopupHandler.dismissKnownPopups(this.page);
+    const blank = this.page.getByText(/^\s*Blank Template/i).first();
+    await blank.waitFor({ state: 'visible', timeout: 30000 });
+    await blank.click();
+    const select = this.page.getByRole('button', { name: 'Select', exact: true });
+    await select.waitFor({ state: 'visible', timeout: 15000 });
+    await select.click();
+    await this.page.waitForLoadState('domcontentloaded');
+    await this.page.waitForTimeout(2000);
+    Logger.info('TEMPLATE', `✅ Blank template chosen for "${pageName}" (content is built in the wiring step)`);
+  }
+
+  /**
+   * Gallery without "Use This Template" buttons: pick a template card, then "Select"
+   * (the same style as the recorded Blank Template choice). Last resort: Blank Template.
+   * Never stops the run over the template choice.
+   */
+  private async selectTemplateWithoutUseButton(pageName: string): Promise<void> {
+    const select = this.page.getByRole('button', { name: 'Select', exact: true });
+    const cards = this.page.locator('[class*="template" i], [class*="card" i]').filter({ hasNotText: /blank template/i }).filter({ has: this.page.locator('img') });
+    const n = await cards.count().catch(() => 0);
+    if (n > 0) {
+      const pick = cards.nth(Math.floor(Math.random() * Math.min(n, 12)));
+      await pick.scrollIntoViewIfNeeded().catch(() => {});
+      await pick.click({ timeout: 8000 }).catch(() => {});
+      if (await select.waitFor({ state: 'visible', timeout: 8000 }).then(() => true).catch(() => false)) {
+        await select.click();
+        await this.page.waitForLoadState('domcontentloaded');
+        await this.page.waitForTimeout(2000);
+        Logger.info('TEMPLATE', `✅ Template chosen for "${pageName}" (card + Select)`);
+        return;
+      }
+    }
+    Logger.warn('TEMPLATE', `No "Use This Template" buttons for "${pageName}" - using Blank Template instead.`);
+    await this.selectBlankTemplate(pageName);
+  }
+
   private async selectRandomTemplate(pageName: string, tabLabel: string): Promise<void> {
     await PopupHandler.dismissKnownPopups(this.page);
 
     const categoryTab = this.page.getByRole('button', { name: tabLabel, exact: true })
       .or(this.page.locator('button, div').filter({ hasText: new RegExp(`^${tabLabel}$`, 'i') })).first();
 
-    if (await categoryTab.isVisible({ timeout: 5000 }).catch(() => false)) {
+    if (await categoryTab.waitFor({ state: 'visible', timeout: 5000 }).then(() => true).catch(() => false)) {
       await categoryTab.click();
       Logger.info('TEMPLATE', `Switched category tab to "${tabLabel}"`);
     }
 
     const templateButtons = this.page.getByRole('button', { name: 'Use This Template' });
-    await expect(templateButtons.first()).toBeVisible({ timeout: 30000 });
+    if (!(await templateButtons.first().waitFor({ state: 'visible', timeout: 30000 }).then(() => true).catch(() => false))) {
+      await this.selectTemplateWithoutUseButton(pageName);
+      return;
+    }
 
     const total = await templateButtons.count();
     const chosenIndex = total > 1 ? Math.floor(Math.random() * total) : 0;
@@ -205,10 +297,11 @@ export class FunnelPage {
   private async publishCurrentPage(spec: PageSpec): Promise<void> {
     await PopupHandler.dismissKnownPopups(this.page);
 
+    await saveEditorPage(this.page); // Save first (keeps buttons / wiring / forms), then Publish
     const publishBtn = this.page.getByRole('button', { name: 'Publish Publish the page live.' })
       .or(this.page.getByRole('button', { name: /^Publish$/ })).first();
 
-    if (!(await publishBtn.isVisible({ timeout: 8000 }).catch(() => false))) {
+    if (!(await publishBtn.waitFor({ state: 'visible', timeout: 8000 }).then(() => true).catch(() => false))) {
       Logger.warn('FUNNEL', `No Publish button found for "${spec.name}" — page may still be on the editor canvas, not the publish screen.`);
       return;
     }
@@ -218,7 +311,7 @@ export class FunnelPage {
 
     if (spec.publishAsButtonName) {
       const confirmBtn = this.page.getByRole('button', { name: new RegExp(spec.publishAsButtonName.replace(/[().]/g, '.'), 'i') }).first();
-      if (await confirmBtn.isVisible({ timeout: 6000 }).catch(() => false)) {
+      if (await confirmBtn.waitFor({ state: 'visible', timeout: 6000 }).then(() => true).catch(() => false)) {
         await confirmBtn.click();
       } else {
         Logger.warn('FUNNEL', `Expected a "${spec.publishAsButtonName}" confirmation for "${spec.name}" but it wasn't found.`);
@@ -257,20 +350,20 @@ export class FunnelPage {
     }
 
     const pageRow = this.page.getByText(spec.name, { exact: false }).first();
-    if (!(await pageRow.isVisible({ timeout: 10000 }).catch(() => false))) {
+    if (!(await pageRow.waitFor({ state: 'visible', timeout: 10000 }).then(() => true).catch(() => false))) {
       Logger.warn('FUNNEL', `Could not find "${spec.name}" in the page list — skipping template assignment.`);
       return;
     }
     await pageRow.click();
     await this.page.waitForTimeout(800);
 
-    const galleryVisible = await this.page.getByText('Choose a Template').isVisible({ timeout: 8000 }).catch(() => false);
+    const galleryVisible = await this.page.getByText('Choose a Template').waitFor({ state: 'visible', timeout: 8000 }).then(() => true).catch(() => false);
     if (galleryVisible) {
       await this.selectRandomTemplate(spec.name, spec.tabLabel);
     } else {
       // Gallery might require an explicit category tab click first (e.g. "Checkout")
       const categoryTab = this.page.getByRole('button', { name: spec.tabLabel, exact: true }).first();
-      if (await categoryTab.isVisible({ timeout: 4000 }).catch(() => false)) {
+      if (await categoryTab.waitFor({ state: 'visible', timeout: 4000 }).then(() => true).catch(() => false)) {
         await categoryTab.click();
         await this.selectRandomTemplate(spec.name, spec.tabLabel);
       } else {
@@ -279,7 +372,7 @@ export class FunnelPage {
     }
 
     const editPageLink = this.page.getByRole('link', { name: 'Edit Page' }).first();
-    if (await editPageLink.isVisible({ timeout: 6000 }).catch(() => false)) {
+    if (await editPageLink.waitFor({ state: 'visible', timeout: 6000 }).then(() => true).catch(() => false)) {
       await editPageLink.click();
       await this.page.waitForLoadState('domcontentloaded');
       await this.publishCurrentPage(spec);

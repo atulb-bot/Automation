@@ -10,6 +10,7 @@ import { FunnelPage } from '../pages/FunnelPage';
 import { FunnelBuilderPage } from '../pages/FunnelBuilderPage';
 import { SalesPage } from '../pages/SalesPage';
 import { PaymentPage } from '../pages/PaymentPage';
+import { keepBrowserOpenIfSingleRun } from '../utils/free-trial-runner';
 
 /**
  * Full journey, single run: login -> create project -> create FE..DS2 products
@@ -28,7 +29,7 @@ test.describe('FlexiFunnels Full Journey', () => {
     // project setup, funnel build, and the live checkout. The 180s default
     // in playwright.config.ts is nowhere near enough for that and made the
     // run look "stuck" (it was just quietly running toward a timeout kill).
-    test.setTimeout(25 * 60 * 1000); // 25 minutes
+    test.setTimeout(60 * 60 * 1000); // 60 minutes (the build alone takes ~25-30 min because of the deliberate settle delays)
 
     const testContext = new TestContext('regular');
     const baseRandom = generateAlphaNumericId(6);
@@ -98,22 +99,28 @@ test.describe('FlexiFunnels Full Journey', () => {
     await funnelBuilderPage.publishAllCheckoutPages(products);
     await funnelBuilderPage.publishThankYouPage();
 
-    // 5. Live buyer journey
-    Logger.info('BUYER', 'Starting live checkout and upsell verification...');
-    const liveSalesPage = await salesPage.openLiveSalesPage();
-    try {
-      await paymentPage.openBuyerJourney(liveSalesPage);
-      await paymentPage.fillCustomerDetails(liveSalesPage);
-      await paymentPage.completeStripePayment(liveSalesPage);
-      await paymentPage.acceptUpsell(liveSalesPage);
-      await paymentPage.verifyFinalPage(liveSalesPage);
-    } finally {
-      await liveSalesPage.close().catch(() => {});
-    }
+    // 5. Live buyer journey (recorded): FE Sales -> Edit Page -> Actions -> Published URL
+    //    -> CTA -> checkout -> Stripe -> Complete Order -> upsells -> Thank You page.
+    //    FUNNEL_PATH=decline runs the "No thanks" path instead (OTO1 -> DS1 -> OTO2 -> DS2).
+    Logger.info('BUYER', 'Starting live checkout and funnel journey...');
+    const path = process.env.FUNNEL_PATH === 'decline' ? 'decline' : 'accept';
+    const liveSalesPage = await funnelBuilderPage.openPublishedUrl('FE Sales');
+    const thankYouUrl = await paymentPage.completeFunnelPurchase(liveSalesPage, path, undefined, undefined, 'oneclick'); // this spec builds a One-Click funnel
+
+    console.log('\n' + '#'.repeat(64));
+    console.log(`>>> ✅ FUNNEL FLOW COMPLETED SUCCESSFULLY (${path} path)`);
+    console.log(`    Project: ${projectName}`);
+    console.log(`    Funnel: ${funnelName}`);
+    console.log(`    Buyer: ${testContext.customerEmail}`);
+    console.log(`    Thank-you URL: ${thankYouUrl}`);
+    console.log('#'.repeat(64) + '\n');
 
     // 6. Persist state so a follow-up run/spec can reuse this project
     saveRunState({ projectName, projectUrl: testContext.projectUrl, baseRandom });
 
     Logger.info('FINISH', '🎉 Full journey (project -> products -> funnel -> checkout) complete!');
+
+    // Same as free trial: single run -> the Thank You page stays open until you close the window.
+    await keepBrowserOpenIfSingleRun(liveSalesPage);
   });
 });

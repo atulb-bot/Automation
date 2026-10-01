@@ -97,8 +97,8 @@ export class ProductsPage {
     await Helpers.waitForAppReady(this.page); // pricing/payment-provider step fetches gateway list async
     await Helpers.stepDelay(this.page);
 
-    // 7. Enable every toggle on the payment-providers step (must happen before Add Pricing).
-    await this.enableAllPaymentToggles();
+    // 7. Payment providers (must happen before Add Pricing): ONLY Stripe on, other gateways off.
+    await this.setStripeOnlyGateway();
     await Helpers.stepDelay(this.page);
 
     // 8. Add Pricing -> Add Price -> Save & Continue
@@ -151,6 +151,71 @@ export class ProductsPage {
     await this.page.waitForLoadState('domcontentloaded');
     await PopupHandler.dismissKnownPopups(this.page);
     Logger.info('PRODUCT', `✅ Product "${productName}" created with pricing + gateway.`);
+  }
+
+  /**
+   * Payment-providers step: switch the Stripe gateway ON and every other payment gateway OFF.
+   * Each toggle is identified by the text next to it. Toggles that are not payment gateways
+   * are left as they are. If no toggle mentions Stripe, falls back to the old behaviour
+   * (enable all) with a warning - the checkout still always picks Stripe.
+   */
+  private async setStripeOnlyGateway(): Promise<void> {
+    const toggleSelector = '[role="switch"], input[type="checkbox"], button[class*="toggle" i]';
+    await expect(async () => {
+      if ((await this.page.locator(toggleSelector).count()) === 0) throw new Error('No toggles rendered on payment step yet');
+    }).toPass({ timeout: 20000 });
+    await this.page.waitForTimeout(1000);
+
+    const toggles = this.page.locator(toggleSelector);
+    const count = await toggles.count();
+    const labels: string[] = [];
+    for (let i = 0; i < count; i++) {
+      labels.push(
+        await toggles.nth(i).evaluate((el) => {
+          let n: HTMLElement | null = el as HTMLElement;
+          for (let k = 0; k < 6 && n; k++) {
+            n = n.parentElement;
+            const t = (n?.innerText || '').replace(/\s+/g, ' ').trim();
+            if (t.length > 2) return t.slice(0, 160);
+          }
+          return '';
+        }).catch(() => '')
+      );
+    }
+
+    const STRIPE = /stripe/i;
+    const OTHER_GATEWAY = /paypal|razorpay|square|authorize\.?net|braintree|paddle|mollie|cashfree|phonepe|instamojo|payu|ccavenue|paystack|flutterwave|2checkout|payoneer|klarna|coinbase|gateway|merchant/i;
+    const hasStripe = labels.some((l) => STRIPE.test(l));
+
+    if (!hasStripe) {
+      Logger.warn('PRODUCT', `No payment toggle mentions "Stripe" (found: ${labels.map((l, i) => `#${i + 1} "${l}"`).join(', ')}). Enabling all as before - the checkout will still pick Stripe.`);
+      await this.enableAllPaymentToggles();
+      return;
+    }
+
+    for (let i = 0; i < count; i++) {
+      const label = labels[i];
+      const want = STRIPE.test(label) ? true : OTHER_GATEWAY.test(label) ? false : null;
+      if (want === null) {
+        Logger.info('PRODUCT', `Toggle #${i + 1} "${label}" - not a payment gateway, left as it is.`);
+        continue;
+      }
+      const ok = await this.setToggle(toggles.nth(i), want);
+      Logger.info('PRODUCT', `Toggle #${i + 1} "${label}" -> ${want ? 'ON (Stripe)' : 'OFF (not Stripe)'}${ok ? '' : ' - COULD NOT CONFIRM'}`);
+      if (want && !ok) throw new Error(`Could not switch the Stripe gateway ON ("${label}").`);
+    }
+    await this.page.waitForTimeout(1500); // let the toggles' own async save settle before Add Pricing
+  }
+
+  /** Sets one toggle to on/off, re-checking up to 3 times (clicks during a slow render can no-op). */
+  private async setToggle(toggle: Locator, on: boolean): Promise<boolean> {
+    await toggle.scrollIntoViewIfNeeded().catch(() => {});
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      if ((await this.isToggleOn(toggle)) === on) return true;
+      await toggle.click({ force: true }).catch(() => {});
+      await this.page.waitForTimeout(600);
+    }
+    return (await this.isToggleOn(toggle)) === on;
   }
 
   /**

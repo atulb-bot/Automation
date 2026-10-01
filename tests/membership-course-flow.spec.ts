@@ -1,12 +1,12 @@
 import { test, expect } from '@playwright/test';
 import { LoginPage } from '../pages/LoginPage';
-import { MembershipPage, CourseConfig } from '../pages/MembershipPage';
+import { MembershipPage, CourseConfig, buildLessons } from '../pages/MembershipPage';
 import { generateRandomLetters } from '../utils/helpers';
 import { TEST_CREDENTIALS } from '../config/test-credentials';
 import { TestContext } from '../utils/test-context';
 
 test.describe('FlexiFunnels Scalable Membership & Multi-Course Engine', () => {
-  test.setTimeout(360000); // 6-minute budget for multi-course creation, publishing, and live checkout
+  test.setTimeout(45 * 60 * 1000); // 45 min: 2 courses x 10 lessons with videos, publishing, and live checkout
 
   function generateLettersOnlySet() {
     return {
@@ -15,6 +15,7 @@ test.describe('FlexiFunnels Scalable Membership & Multi-Course Engine', () => {
       courseTwoName: `OneTime${generateRandomLetters(6)}`,
       groupName: `Community${generateRandomLetters(5)}`,
       instructorName: `Instructor${generateRandomLetters(5)}`,
+      instructorTwoName: `Instructor${generateRandomLetters(5)}`,
       buyerName: `Buyer${generateRandomLetters(6)}`,
       buyerEmail: `${generateRandomLetters(10).toLowerCase()}@flexifunnels.com`,
     };
@@ -68,21 +69,22 @@ test.describe('FlexiFunnels Scalable Membership & Multi-Course Engine', () => {
         moduleName: 'Foundation Module',
         lessonName: 'Setup Overview',
         youtubeUrl: 'https://youtu.be/9QyiEgv33z4',
+        lessonCount: 1, // lessons in this module (each gets the YouTube video above)
       };
 
       await membershipPage.createCourse(membershipTab, subscriptionCourse);
-      await membershipPage.addModuleAndLesson(
+      await membershipPage.addModuleWithLessons(
         membershipTab,
+        subscriptionCourse.courseName,
         subscriptionCourse.moduleName,
-        subscriptionCourse.lessonName,
-        subscriptionCourse.youtubeUrl
+        buildLessons(subscriptionCourse)
       );
 
       // 5. Build Course 2: One-Time Lifetime Access in the Same Project
       const oneTimeCourse: CourseConfig = {
         courseName: data.courseTwoName,
         courseSummary: 'Single payment lifetime training material',
-        instructorName: data.instructorName,
+        instructorName: data.instructorTwoName, // new instructor for the 2nd course
         instructorBio: 'Seasoned platform educator',
         city: 'Dehradun',
         supportEmail: 'support@flexifunnels.com',
@@ -92,14 +94,15 @@ test.describe('FlexiFunnels Scalable Membership & Multi-Course Engine', () => {
         moduleName: 'Advanced Playbook',
         lessonName: 'Execution Blueprint',
         youtubeUrl: 'https://youtu.be/9QyiEgv33z4',
+        lessonCount: 1, // lessons in this module (each gets the YouTube video above)
       };
 
       await membershipPage.createCourse(membershipTab, oneTimeCourse);
-      await membershipPage.addModuleAndLesson(
+      await membershipPage.addModuleWithLessons(
         membershipTab,
+        oneTimeCourse.courseName,
         oneTimeCourse.moduleName,
-        oneTimeCourse.lessonName,
-        oneTimeCourse.youtubeUrl
+        buildLessons(oneTimeCourse)
       );
 
       // 6. Create Community Group

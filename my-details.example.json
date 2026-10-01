@@ -1,0 +1,9 @@
+{
+  "_help": "Copy this file to my-details.json and put YOUR details in it. Test sign-ups use testEmail with +aliases (your.name+abc123@company.com), so all test mails come to you.",
+  "loginEmail": "your.flexifunnels.login@example.com",
+  "loginPassword": "your-password",
+  "testEmail": "your.name@company.com",
+  "firstName": "YourName",
+  "phone": "1234567890",
+  "city": "Dehradun"
+}

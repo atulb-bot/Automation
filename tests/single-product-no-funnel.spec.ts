@@ -10,6 +10,7 @@ import { FunnelPage } from '../pages/FunnelPage';
 import { FunnelBuilderPage } from '../pages/FunnelBuilderPage';
 import { SalesPage } from '../pages/SalesPage';
 import { PaymentPage } from '../pages/PaymentPage';
+import { keepBrowserOpenIfSingleRun } from '../utils/free-trial-runner';
 
 /**
  * Single-product, no-funnel run: login -> create project -> create ONLY the
@@ -89,33 +90,36 @@ test.describe('FlexiFunnels Single Product (No Funnel)', () => {
     // what sends the buyer to its checkout — there's no separate downsell
     // product in a single-product/no-funnel run, so both the main CTA and
     // the "No thanks" decline button wire to this same product.
-    await funnelBuilderPage.wireSalesPageToProduct(
-      product.salesPageName,
-      product.productName,
-      product.productName
-    );
+    // Recorded flow (same as the funnel test's FE page): add CTA -> Go To Next Step In Product -> FE,
+    // no "No thanks" (single product). PAGE_MODE=blank builds the page itself (Section, 2 columns, "Sales FE", button).
+    await funnelBuilderPage.wireAndPublishSalesPage(product, {
+      withNoThanks: false,
+      blank: process.env.PAGE_MODE !== 'template', // blank pages by default
+    });
 
-    // 4b. Publish Checkout + Thank You now that the CTA is wired.
     await funnelBuilderPage.publishAllCheckoutPages([product]);
     await funnelBuilderPage.publishThankYouPage();
 
-    // 5. Live buyer journey: FE Sales -> Checkout -> Payment -> Thank You.
-    // No acceptUpsell() call -- there's no upsell in a no-funnel single
-    // product flow.
+    // Recorded purchase: FE Sales -> Edit Page -> Actions -> Published URL -> CTA -> checkout
+    // -> Stripe card -> Complete Order -> Thank You page (left open).
     Logger.info('BUYER', 'Starting live checkout...');
-    const liveSalesPage = await salesPage.openLiveSalesPage();
-    try {
-      await paymentPage.openBuyerJourney(liveSalesPage);
-      await paymentPage.fillCustomerDetails(liveSalesPage);
-      await paymentPage.completeStripePayment(liveSalesPage);
-      await paymentPage.verifyFinalPage(liveSalesPage);
-    } finally {
-      await liveSalesPage.close().catch(() => {});
-    }
+    const liveSalesPage = await funnelBuilderPage.openPublishedUrl(product.salesPageName);
+    const thankYouUrl = await paymentPage.completeFunnelPurchase(liveSalesPage, 'accept');
 
-    // 6. Persist state, same as the other specs.
+    console.log('\n' + '#'.repeat(64));
+    console.log('>>> ✅ SINGLE PRODUCT FLOW COMPLETED SUCCESSFULLY');
+    console.log(`    Project: ${projectName}`);
+    console.log(`    Product: ${product.productName} ($${product.price})`);
+    console.log(`    Pages: ${process.env.PAGE_MODE === 'template' ? 'templates' : 'blank (built by the script)'}`);
+    console.log(`    Buyer: ${testContext.customerEmail}`);
+    console.log(`    Thank-you URL: ${thankYouUrl}`);
+    console.log('#'.repeat(64) + '\n');
+
     saveRunState({ projectName, projectUrl: testContext.projectUrl, baseRandom });
 
     Logger.info('FINISH', '🎉 Single-product (no funnel) run complete!');
+
+    // Same as free trial: single run -> the Thank You page stays open until you close the window.
+    await keepBrowserOpenIfSingleRun(liveSalesPage);
   });
 });

@@ -1,9 +1,11 @@
 import { Page, Locator, expect } from '@playwright/test';
 import { Logger } from '../utils/logger';
 import { PopupHandler } from '../utils/popup-handler';
+import { waitForManualStep } from '../utils/manual-assist';
 import { TestContext } from '../utils/test-context';
 import { Helpers } from '../utils/helpers';
 import { ProductConfig } from './ProductsPage';
+import { saveEditorPage } from '../utils/editor-save';
 
 export class FunnelBuilderPage {
   constructor(private page: Page, private context: TestContext) {}
@@ -98,6 +100,7 @@ export class FunnelBuilderPage {
     // there's no other node with fresh unattached branches for its click to
     // be mis-targeted onto.
     await this.addFunnelStep('DS2 (OTO2 -> Say no to)', ds2Product.productName, { sourceProductName: oto2Product.productName, branch: 'downsell' }, funnelName);
+    await this.ensureStepWired('OTO2 -> Say no to -> DS2', ds2Product.productName, { sourceProductName: oto2Product.productName, branch: 'downsell' }, funnelName);
 
     // Verify the tree actually landed as intended before handing control
     // back to the caller (which typically wires the sales page next). This
@@ -163,6 +166,45 @@ export class FunnelBuilderPage {
     } else {
       Logger.info('FUNNEL_BUILDER', 'Verified all funnel branches wired to the correct next step.');
     }
+  }
+
+  /**
+   * Confirms a branch is wired to the expected product. If not, adds the step once more;
+   * if it is STILL not wired, stops the run with a clear message (used for the last step,
+   * OTO2 -> "Say no to" -> DS2, which used to go missing silently).
+   */
+  private async ensureStepWired(
+    label: string,
+    expectedProductName: string,
+    target: { sourceProductName: string; branch: 'upsell' | 'downsell' },
+    funnelName?: string
+  ): Promise<void> {
+    const check = () =>
+      this.withTimeout(this.verifyStepWiring(target.sourceProductName, target.branch, expectedProductName, funnelName), 30000, false);
+
+    await this.page.waitForTimeout(2000);
+    if (await check()) {
+      Logger.info('FUNNEL_BUILDER', `✅ Confirmed: ${label}`);
+      return;
+    }
+    Logger.warn('FUNNEL_BUILDER', `${label} not found in the funnel steps - adding it again.`);
+    await this.page.reload({ waitUntil: 'domcontentloaded' }).catch(() => {});
+    await this.page.waitForTimeout(4000);
+    if (await check()) {
+      Logger.info('FUNNEL_BUILDER', `✅ Confirmed after reload: ${label}`);
+      return;
+    }
+    await this.addFunnelStep(`${label} (retry)`, expectedProductName, target, funnelName);
+    await this.page.waitForTimeout(2000);
+    if (await check()) {
+      Logger.info('FUNNEL_BUILDER', `✅ Confirmed after retry: ${label}`);
+      return;
+    }
+    await Helpers.captureDiagnosticScreenshot(this.page, `funnel-step-missing-${label}`);
+    if (await waitForManualStep(this.page, `Add the funnel step: ${label}`,
+      `In Funnel Steps: on the "${target.branch === 'upsell' ? 'Purchases' : 'Say no to'}" row of "${target.sourceProductName}" click Add Next Step and choose "${expectedProductName}".`,
+      () => check())) return;
+    throw new Error(`Funnel step missing: ${label}. The "${target.branch === 'upsell' ? 'Purchases' : 'Say no to'}" row of "${target.sourceProductName}" is not showing "${expectedProductName}" as its next step. Screenshot saved in test-results/.`);
   }
 
   /**
@@ -232,7 +274,23 @@ export class FunnelBuilderPage {
 
         const all = Array.from(document.querySelectorAll('body *')) as HTMLElement[];
         const actionEls = all.filter((el) => ownExactText(el) === actionText).sort(bySmallestArea);
-        const productEls = all.filter((el) => ownExactText(el) === sourceProductName).sort(bySmallestArea);
+        // Only the PRODUCT NAME cell of a row counts (it sits next to "ID: 133539").
+        // The same name also appears as a chip in other rows' NEXT STEP column -- those have no ID
+        // and used to be mistaken for this product's row.
+        const isProductCell = (el: HTMLElement): boolean => {
+          let n: HTMLElement | null = el;
+          for (let i = 0; i < 3 && n; i++) {
+            n = n.parentElement;
+            if (!n) break;
+            const t = (n.textContent || '').replace(/\s+/g, ' ').trim();
+            if (/ID:\s*\d+/.test(t) && t.length <= sourceProductName.length + 30) return true;
+          }
+          return false;
+        };
+        const productEls = all
+          .filter((el) => ownExactText(el) === sourceProductName)
+          .filter(isProductCell)
+          .sort(bySmallestArea);
         const nextStepButtons = Array.from(document.querySelectorAll('button')).filter((b) =>
           (b.textContent || '').replace(/\s+/g, ' ').includes('Add Next Step')
         ) as HTMLButtonElement[];
@@ -273,10 +331,6 @@ export class FunnelBuilderPage {
           // and that funnel isn't the one we're building, it can't be this
           // row's real wiring -- skip it and keep checking other action-el
           // matches instead of trusting it or giving up.
-          if (funnelName && candidate && candidate.includes('|') && !candidate.includes(funnelName)) {
-            continue;
-          }
-
           return { hasButton: false, nextStepText: candidate };
         }
 
@@ -486,7 +540,7 @@ export class FunnelBuilderPage {
     const count = await buttons.count();
     for (let i = count - 1; i >= 0; i--) {
       const btn = buttons.nth(i);
-      if (await btn.isVisible({ timeout: 2000 }).catch(() => false)) {
+      if (await btn.waitFor({ state: 'visible', timeout: 2000 }).then(() => true).catch(() => false)) {
         await btn.scrollIntoViewIfNeeded().catch(() => {});
         await btn.click();
         return true;
@@ -517,9 +571,9 @@ export class FunnelBuilderPage {
     // "Add Next Step" actually opens the product picker. Only fire this
     // fallback when the picker didn't show up on its own, so steps that
     // don't need it aren't slowed down or knocked off track.
-    if (!(await stepProductTrigger.isVisible({ timeout: 4000 }).catch(() => false))) {
+    if (!(await stepProductTrigger.waitFor({ state: 'visible', timeout: 4000 }).then(() => true).catch(() => false))) {
       const unlockIcon = this.page.locator('.w-8.h-8.flex.items-center.justify-center.rounded-md').first();
-      if (await unlockIcon.isVisible({ timeout: 2000 }).catch(() => false)) {
+      if (await unlockIcon.waitFor({ state: 'visible', timeout: 2000 }).then(() => true).catch(() => false)) {
         await unlockIcon.click();
         await Helpers.stepDelay(this.page);
         await this.clickAddNextStep(branchTarget, funnelName);
@@ -556,36 +610,391 @@ export class FunnelBuilderPage {
    * downsell offer directly, instead of only having the main "buy" CTA wired.
    */
   public async wireAllSalesPages(products: ProductConfig[], funnelName: string): Promise<void> {
-    const [feProduct, oto1Product, ds1Product, oto2Product, ds2Product] = products;
-
-    // Main-CTA "next step" targets, matching the tree built in createFunnel().
-    // OTO2 and DS2 have no further explicit step after their own main CTA
-    // (the funnel ends at the Thank You page from there), so no expected
-    // target is given for them -- wireSalesPageToFunnel falls back to
-    // whatever the popup offers by default rather than guessing.
-    const nextPageForKey: Partial<Record<ProductConfig['key'], string>> = {
-      FE: oto1Product?.salesPageName,
-      OTO1: oto2Product?.salesPageName,
-      DS1: oto2Product?.salesPageName,
-    };
-
-    // "No thanks" decline-link targets: only the OTO (upsell) pages have a
-    // downsell branch to skip straight to.
-    const noThanksTargetForKey: Partial<Record<ProductConfig['key'], string>> = {
-      OTO1: ds1Product?.salesPageName,
-      OTO2: ds2Product?.salesPageName,
-    };
-
-    for (const product of products) {
-      Logger.info('FUNNEL_BUILDER', `Wiring sales page for "${product.key}" ("${product.salesPageName}")...`);
-      await this.wireSalesPageToFunnel(
-        product.salesPageName,
+    // Recorded flow (same steps for every sales page, only the product changes):
+    //   open "<X> Sales" -> select a spot -> Components -> Elements -> Button -> select new CTA
+    //   -> Components -> No Thanks Button -> CTA -> settings -> Go To Next Step In Product
+    //   -> "--select a one--" -> "<X> product" -> Publish -> Publish as Sales Page -> Close
+    // The product's funnel ("${funnelName}") then routes the buyer to the next step.
+    for (let i = 0; i < products.length; i++) {
+      const product = products[i];
+      Logger.info('FUNNEL_BUILDER', `[${i + 1}/${products.length}] Wiring "${product.salesPageName}" -> product "${product.productName}"`);
+      await this.wireAndPublishSalesPage(product, {
         funnelName,
-        nextPageForKey[product.key],
-        noThanksTargetForKey[product.key]
-      );
+        withNoThanks: product.key !== 'FE', // funnel flow: every page except FE gets a wired "No thanks"
+        blank: process.env.PAGE_MODE !== 'template', // blank pages by default
+      });
     }
     Logger.info('FUNNEL_BUILDER', `✅ Wired and published all ${products.length} sales pages.`);
+  }
+
+  /**
+   * One sales page, as recorded. Stops with a clear error if anything can't be done.
+   *   blank=false (template page): select a spot -> Components -> Elements -> Button
+   *   blank=true  (Blank Template): +Add New Section -> Section -> +Add Row -> 2 Columns
+   *               -> +Add Element -> Headline "Sales FE" -> +Add Element -> Button
+   * then: [No Thanks Button under the CTA]  -> CTA: funnel flow -> Go To Next Step In Funnel -> funnel -> own product
+   *                                                single product -> Go To Next Step In Product -> own product
+   *       -> [No thanks: Go To Next Step In Funnel -> funnel -> own product -> Upsell / Downsell]
+   *       -> Publish -> Publish as Sales Page -> Close
+   */
+  public async wireAndPublishSalesPage(
+    product: ProductConfig,
+    opts: { funnelName?: string; withNoThanks?: boolean; blank?: boolean; headline?: string } = {}
+  ): Promise<void> {
+    const pageName = product.salesPageName;
+    this.context.recordStep(`Wire Sales Page (Product): ${pageName}`);
+
+    if (!(await this.openPageInProjectEditor(pageName))) {
+      throw new Error(`Could not open "${pageName}" in the editor.`);
+    }
+    const frame = this.page.locator('iframe:not([name="fc_widget"])').first().contentFrame();
+    const CTA = /click here to get access|warning\s*-\s*button action/i;
+    const NO_THANKS = /^\s*no,?\s*thanks\s*$/i;
+
+    // Wait for the canvas to load (a blank page shows "+Add New Section")
+    const canvasReady = await frame
+      .locator('section, h1, h2, h3, p')
+      .or(frame.getByText('+Add New Section'))
+      .first()
+      .waitFor({ state: 'visible', timeout: 45000 })
+      .then(() => true)
+      .catch(() => false);
+    if (!canvasReady) {
+      await Helpers.captureDiagnosticScreenshot(this.page, `canvas-not-loaded-${pageName}`);
+      throw new Error(`"${pageName}": the editor canvas did not load.`);
+    }
+    await this.page.waitForTimeout(2000);
+
+    // Mark what is already on the page, so NEW elements can be told apart
+    await frame.locator('a, button').evaluateAll((els) => els.forEach((e) => e.setAttribute('data-ff-old', '1'))).catch(() => {});
+    const newCta = frame.getByRole('link', { name: CTA }).and(frame.locator(':not([data-ff-old])'));
+    const newNoThanks = frame.getByRole('link', { name: NO_THANKS }).and(frame.locator(':not([data-ff-old])'));
+
+    if (opts.blank) {
+      await this.buildBlankSalesContent(frame, product, opts.headline);
+      await this.clickFrameText(frame, '+Add Element', pageName);
+      await this.clickTitle('Button', pageName);
+    } else {
+      // Select a spot in the first section, then Components -> Elements -> Button
+      await frame.locator('section').first().locator('h1, h2, h3, p').first().click({ timeout: 15000 }).catch(() => {});
+      await this.page.waitForTimeout(1000);
+      await this.clickPanel('Components', pageName);
+      await this.clickPanel('Elements', pageName, true);
+      await this.clickTitle('Button', pageName);
+    }
+    if (!(await newCta.first().waitFor({ state: 'visible', timeout: 20000 }).then(() => true).catch(() => false))) {
+      await Helpers.captureDiagnosticScreenshot(this.page, `cta-not-added-${pageName}`);
+      const anyCta = frame.getByRole('link', { name: CTA });
+      const done = await waitForManualStep(this.page, `Add the CTA button on "${pageName}"`,
+        'In the editor: Components -> Elements -> Button (drop it on the page).',
+        async () => (await anyCta.count()) > 0);
+      if (!done) throw new Error(`"${pageName}": the new button did not appear on the page.`);
+    }
+    Logger.info('FUNNEL_BUILDER', `"${pageName}": CTA button added`);
+
+    // Tag every CTA now (its label changes once wired, so the tag keeps track of it)
+    const ctaCount = await frame.getByRole('link', { name: CTA }).evaluateAll((els) => {
+      els.forEach((e, i) => e.setAttribute('data-ff-cta', String(i)));
+      return els.length;
+    });
+
+    // No Thanks Button (funnel flow, not on FE). The editor refuses to drop it onto the button itself
+    // ("Invalid target position"), so a valid spot under the CTA is selected first.
+    if (opts.withNoThanks) {
+      await this.addNoThanksUnderCta(frame, newCta, newNoThanks, pageName, !!opts.blank);
+    }
+
+    // Wire every CTA:
+    //   funnel flow    -> Go To Next Step In Funnel -> funnel -> own product -> Link To
+    //                     (FE: "Checkout" when offered, else "Upsell / Downsell"; other pages: "Upsell / Downsell")
+    //   single product -> Go To Next Step In Product -> own product
+    const inFunnel = !!opts.funnelName;
+    // FE's funnel popup has only funnel + product (no "Link To"); OTO1..DS2 also have "Link To"
+    const ctaLinkTo = product.key === 'FE' ? [] : [/upsell\s*\/\s*downsell/i];
+    const WARN = /warning\s*-\s*button action/i;
+    for (let i = 0; i < ctaCount; i++) {
+      const el = frame.locator(`[data-ff-cta="${i}"]`);
+      const label = `"${pageName}" CTA ${i + 1}/${ctaCount}`;
+      const hadWarning = WARN.test((await el.innerText().catch(() => '')) || '');
+      let ok = false;
+      for (let attempt = 1; attempt <= 2 && !ok; attempt++) {
+        await el.scrollIntoViewIfNeeded().catch(() => {});
+        await el.click({ timeout: 10000 }).catch(() => {});
+        await this.page.waitForTimeout(1500);
+        const l = attempt === 1 ? label : `${label} (retry)`;
+        ok = inFunnel
+          ? await this.wireSelectedElementToNextStep(opts.funnelName, product.productName, l, ctaLinkTo)
+          : await this.wireSelectedToProduct(product.productName, l);
+      }
+      if (!ok) {
+        await Helpers.captureDiagnosticScreenshot(this.page, `cta-not-wired-${pageName}-${i + 1}`);
+        const how = inFunnel
+          ? `Select the button -> Style Settings -> Go To Next Step In Funnel -> "${opts.funnelName}" -> "${product.productName}"${product.key === 'FE' ? '' : ' -> Link To: Upsell / Downsell'}`
+          : `Select the button -> Style Settings -> Go To Next Step In Product -> "${product.productName}"`;
+        const done = await waitForManualStep(this.page, `Wire ${label}`, how,
+          hadWarning ? async () => !WARN.test((await el.innerText().catch(() => '')) || '') : undefined);
+        if (!done) throw new Error(`${label} could not be wired (${inFunnel ? `funnel "${opts.funnelName}", ` : ''}product "${product.productName}"). Screenshot saved in test-results/.`);
+      }
+    }
+
+    // Wire every "No thanks" -> Go To Next Step In Funnel -> funnel -> own product -> Upsell / Downsell
+    if (opts.withNoThanks) {
+      const nt = frame.getByRole('link', { name: NO_THANKS });
+      const ntCount = await nt.evaluateAll((els) => {
+        els.forEach((e, i) => e.setAttribute('data-ff-nt', String(i)));
+        return els.length;
+      });
+      for (let i = 0; i < ntCount; i++) {
+        const el = frame.locator(`[data-ff-nt="${i}"]`);
+        const label = `"${pageName}" No thanks ${i + 1}/${ntCount}`;
+        let ok = false;
+        for (let attempt = 1; attempt <= 2 && !ok; attempt++) {
+          await el.scrollIntoViewIfNeeded().catch(() => {});
+          await el.click({ timeout: 10000 }).catch(() => {});
+          await this.page.waitForTimeout(1500);
+          ok = await this.wireSelectedElementToNextStep(opts.funnelName, product.productName, attempt === 1 ? label : `${label} (retry)`);
+        }
+        if (!ok) {
+          await Helpers.captureDiagnosticScreenshot(this.page, `no-thanks-not-wired-${pageName}-${i + 1}`);
+          const done = await waitForManualStep(this.page, `Wire ${label}`,
+            `Select "No thanks" -> Style Settings -> Go To Next Step In Funnel -> "${opts.funnelName}" -> "${product.productName}" -> Link To: Upsell / Downsell`);
+          if (!done) throw new Error(`${label} could not be wired (funnel "${opts.funnelName}", product "${product.productName}"). Screenshot saved in test-results/.`);
+        }
+      }
+    }
+
+    // Publish -> Publish as Sales Page -> Close (bounded: cannot hang)
+    await saveEditorPage(this.page, pageName); // Save first (keeps buttons / wiring / forms), then Publish
+    await this.publishCurrentPage(pageName);
+    Logger.info('FUNNEL_BUILDER', `✅ "${pageName}": CTA -> ${inFunnel ? 'funnel' : 'product'} "${product.productName}"${opts.withNoThanks ? ', No thanks -> funnel' : ''}, published`);
+  }
+
+  /**
+   * Adds the "No Thanks Button" under the new CTA. Tries, in order, until one works:
+   *   1. blank page: the column's "+Add Element" (same spot the Button came from)
+   *   2. select the CTA, then the toolbar's first icon (select parent = its container)
+   *   3. click the CTA's container directly
+   * Each try is checked: the new "No thanks" must appear and no "Invalid target position" toast.
+   */
+  private async addNoThanksUnderCta(
+    frame: import('@playwright/test').FrameLocator,
+    newCta: import('@playwright/test').Locator,
+    newNoThanks: import('@playwright/test').Locator,
+    pageName: string,
+    blank: boolean
+  ): Promise<void> {
+    const invalidToast = this.page.getByText(/invalid target position/i).first();
+    const strategies: { name: string; select: () => Promise<boolean> }[] = [];
+
+    if (blank) {
+      strategies.push({
+        name: 'column "+Add Element"',
+        select: async () => {
+          const ph = frame.getByText('+Add Element', { exact: true }).first();
+          if (!(await ph.waitFor({ state: 'visible', timeout: 8000 }).then(() => true).catch(() => false))) return false;
+          await ph.click();
+          return true;
+        },
+      });
+    }
+    strategies.push({
+      name: 'CTA -> toolbar "select parent"',
+      select: async () => {
+        await newCta.first().click({ timeout: 10000 }).catch(() => {});
+        await this.page.waitForTimeout(1200);
+        const gear = this.page.locator('div:nth-child(5) > svg').first();
+        if (!(await gear.waitFor({ state: 'visible', timeout: 5000 }).then(() => true).catch(() => false))) return false;
+        const parentIcon = gear.locator('xpath=../../div[1]');
+        if (!(await parentIcon.isVisible().catch(() => false))) return false;
+        await parentIcon.click();
+        return true;
+      },
+    });
+    strategies.push({
+      name: "CTA's container",
+      select: async () => {
+        const container = newCta.first().locator('xpath=..');
+        const box = await container.boundingBox().catch(() => null);
+        if (!box) return false;
+        // click the container's edge, not the button inside it
+        await container.click({ position: { x: 3, y: Math.max(2, box.height - 3) }, timeout: 8000 }).catch(() => {});
+        return true;
+      },
+    });
+
+    for (const strat of strategies) {
+      if (!(await strat.select())) continue;
+      await this.page.waitForTimeout(1200);
+      await this.clickPanel('Components', pageName);
+      await this.clickTitle('No Thanks Button', pageName);
+
+      const end = Date.now() + 12000;
+      let added = false;
+      let invalid = false;
+      while (Date.now() < end) {
+        if (await newNoThanks.first().isVisible().catch(() => false)) { added = true; break; }
+        if (await invalidToast.isVisible().catch(() => false)) { invalid = true; break; }
+        await this.page.waitForTimeout(400);
+      }
+      if (added) {
+        Logger.info('FUNNEL_BUILDER', `"${pageName}": No Thanks button added (via ${strat.name})`);
+        return;
+      }
+      Logger.warn('FUNNEL_BUILDER', `"${pageName}": No Thanks via ${strat.name} ${invalid ? 'was rejected ("Invalid target position")' : 'did not appear'} - trying the next spot`);
+      // close the toast so it doesn't count against the next try
+      await this.page.locator('button', { has: this.page.locator('svg') }).filter({ hasText: /^\s*$/ })
+        .and(this.page.locator(':near(:text("Invalid target position"))')).first().click({ timeout: 2000 }).catch(() => {});
+      await invalidToast.waitFor({ state: 'hidden', timeout: 8000 }).catch(() => {});
+    }
+
+    await Helpers.captureDiagnosticScreenshot(this.page, `no-thanks-not-added-${pageName}`);
+    const done = await waitForManualStep(this.page, `Add the "No thanks" button on "${pageName}"`,
+      'In the editor: click under the CTA button, then Components -> No Thanks Button.',
+      async () => (await frame.getByRole('link', { name: /^\s*no,?\s*thanks\s*$/i }).count()) > 0);
+    if (!done) throw new Error(`"${pageName}": could not add the No Thanks button under the CTA (every spot was rejected).`);
+  }
+
+  /**
+   * Blank page (recorded): +Add New Section -> Section -> +Add Row -> 2 Columns
+   * -> +Add Element -> Headline -> "Sales FE" / "Sales OTO1" ...
+   */
+  private async buildBlankSalesContent(frame: import('@playwright/test').FrameLocator, product: ProductConfig, headline?: string) {
+    const pageName = product.salesPageName;
+    const headingText = headline || `Sales ${product.key}`;
+    await this.clickFrameText(frame, '+Add New Section', pageName);
+    await this.clickTitle('Section', pageName);
+    await this.clickFrameText(frame, '+Add Row', pageName);
+    await this.clickTitle('2 Columns', pageName);
+
+    // Headline into the first column
+    await this.clickFrameText(frame, '+Add Element', pageName);
+    await this.clickTitle('Headline', pageName);
+    const heading = frame.getByRole('heading').last();
+    await heading.waitFor({ state: 'visible', timeout: 15000 });
+    await heading.dblclick();
+    await this.page.waitForTimeout(500);
+    await heading.press('ControlOrMeta+a');
+    await heading.pressSequentially(headingText, { delay: 40 });
+    await this.page.waitForTimeout(800);
+    // click away so the text edit is committed
+    await frame.locator('body').click({ position: { x: 5, y: 5 } }).catch(() => {});
+    await this.page.waitForTimeout(800);
+    Logger.info('FUNNEL_BUILDER', `"${pageName}": section + 2 columns + headline "${headingText}" added`);
+  }
+
+  /** Clicks a "+Add ..." placeholder on the canvas (waits for it). */
+  private async clickFrameText(frame: import('@playwright/test').FrameLocator, text: string, pageName: string) {
+    const el = frame.getByText(text, { exact: true }).first();
+    if (!(await el.waitFor({ state: 'visible', timeout: 20000 }).then(() => true).catch(() => false))) {
+      await Helpers.captureDiagnosticScreenshot(this.page, `canvas-${text}-${pageName}`);
+      throw new Error(`"${pageName}": "${text}" not found on the canvas.`);
+    }
+    await el.click();
+    await this.page.waitForTimeout(1500);
+  }
+
+  /** Clicks a left-panel button like "Components" / "Elements" (optional ones may already be open). */
+  private async clickPanel(name: string, pageName: string, optional = false) {
+    const btn = this.page.getByRole('button', { name, exact: true }).first();
+    if (!(await btn.waitFor({ state: 'visible', timeout: optional ? 5000 : 15000 }).then(() => true).catch(() => false))) {
+      if (optional) return;
+      await Helpers.captureDiagnosticScreenshot(this.page, `panel-${name}-${pageName}`);
+      throw new Error(`"${pageName}": "${name}" panel button not found.`);
+    }
+    await btn.click();
+    await this.page.waitForTimeout(1000);
+  }
+
+  /** Clicks a block in the Components list by its title ("Button", "No Thanks Button"). */
+  private async clickTitle(title: string, pageName: string) {
+    const el = this.page.getByTitle(title, { exact: true }).first();
+    if (!(await el.waitFor({ state: 'visible', timeout: 15000 }).then(() => true).catch(() => false))) {
+      await Helpers.captureDiagnosticScreenshot(this.page, `block-${title}-${pageName}`);
+      throw new Error(`"${pageName}": "${title}" block not found in Components.`);
+    }
+    await el.click();
+    await this.page.waitForTimeout(3000); // let the new element render on the canvas
+  }
+
+  /**
+   * With a button selected: [settings gear] -> Go To Next Step In Product -> "--select a one--"
+   * -> the product -> confirms the picker now shows that product.
+   */
+  private async wireSelectedToProduct(productName: string, label: string): Promise<boolean> {
+    const inProduct = this.page.getByRole('button', { name: 'Go To Next Step In Product' }).first();
+    // The action panel may already be open from the previous button; otherwise open it via the gear
+    if (!(await inProduct.waitFor({ state: 'visible', timeout: 2500 }).then(() => true).catch(() => false))) {
+      await this.openElementActionPanel();
+      if (!(await inProduct.waitFor({ state: 'visible', timeout: 10000 }).then(() => true).catch(() => false))) {
+        Logger.warn('FUNNEL_BUILDER', `${label}: "Go To Next Step In Product" not found.`);
+        return false;
+      }
+    }
+    await inProduct.click();
+    await this.page.waitForTimeout(1500);
+
+    const esc = productName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const trigger = this.page
+      .getByRole('button', { name: /--\s*select a one\s*--/i })
+      .or(this.page.getByRole('button', { name: new RegExp(`^\\s*${esc}\\s*$`, 'i') }))
+      .first();
+    if (!(await trigger.waitFor({ state: 'visible', timeout: 10000 }).then(() => true).catch(() => false))) {
+      Logger.warn('FUNNEL_BUILDER', `${label}: product picker ("--select a one--") not found.`);
+      return false;
+    }
+    if (new RegExp(`^\\s*${esc}\\s*$`, 'i').test((await trigger.innerText().catch(() => '')).trim())) {
+      Logger.info('FUNNEL_BUILDER', `${label}: already wired to "${productName}"`);
+      return true;
+    }
+    await trigger.click();
+    await this.page.waitForTimeout(800);
+
+    const option = this.page.getByRole('option', { name: productName, exact: true });
+    if (!(await option.waitFor({ state: 'visible', timeout: 5000 }).then(() => true).catch(() => false))) {
+      const search = this.page.getByRole('textbox', { name: /search/i }).last();
+      if (await search.isVisible().catch(() => false)) {
+        await search.fill(productName);
+        await this.page.waitForTimeout(1200);
+      }
+    }
+    if (!(await option.waitFor({ state: 'visible', timeout: 15000 }).then(() => true).catch(() => false))) {
+      Logger.warn('FUNNEL_BUILDER', `${label}: product "${productName}" is not in the product list.`);
+      await this.page.keyboard.press('Escape').catch(() => {});
+      return false;
+    }
+    await option.click();
+    await this.page.waitForTimeout(1500);
+
+    const shown = this.page.getByRole('button', { name: new RegExp(`^\\s*${esc}\\s*$`, 'i') }).first();
+    if (!(await shown.waitFor({ state: 'visible', timeout: 8000 }).then(() => true).catch(() => false))) {
+      Logger.warn('FUNNEL_BUILDER', `${label}: picked "${productName}" but the picker does not show it.`);
+      return false;
+    }
+    Logger.info('FUNNEL_BUILDER', `✅ ${label}: Go To Next Step In Product -> "${productName}"`);
+    return true;
+  }
+
+  /** Recorded: open "<page>" -> Edit Page -> Actions -> "Published URL" (new tab). */
+  /** Opens a page of the current project in the editor (used by the email opt-in flow). */
+  public async openPageInEditor(pageName: string): Promise<boolean> {
+    return this.openPageInProjectEditor(pageName);
+  }
+
+  public async openPublishedUrl(pageName: string = 'FE Sales'): Promise<Page> {
+    if (!(await this.openPageInProjectEditor(pageName))) {
+      throw new Error(`Could not open "${pageName}" to get its Published URL.`);
+    }
+    const actions = this.page.getByRole('button', { name: 'Actions', exact: true }).first();
+    await actions.waitFor({ state: 'visible', timeout: 20000 });
+    await actions.click();
+    const published = this.page.getByRole('link', { name: 'Published URL' }).first();
+    await published.waitFor({ state: 'visible', timeout: 10000 });
+    const popup = this.page.waitForEvent('popup', { timeout: 30000 });
+    await published.click();
+    const live = await popup;
+    await live.waitForLoadState('domcontentloaded');
+    Logger.info('FUNNEL_BUILDER', `Live "${pageName}" opened: ${live.url()}`);
+    return live;
   }
 
   /**
@@ -658,14 +1067,14 @@ export class FunnelBuilderPage {
     const settingsBtn = this.page.locator('div:nth-child(5) > svg > path')
       .or(this.page.locator('#ff-tools').getByTitle('Style Settings'))
       .or(this.page.getByTitle('Style Settings')).first();
-    if (await settingsBtn.isVisible({ timeout: 4000 }).catch(() => false)) {
+    if (await settingsBtn.waitFor({ state: 'visible', timeout: 4000 }).then(() => true).catch(() => false)) {
       await settingsBtn.click();
       await this.dismissAdvancedSettingsTooltip();
       return;
     }
 
     const toolbarIcon = this.page.getByRole('img').filter({ hasText: /^$/ }).nth(5);
-    if (await toolbarIcon.isVisible({ timeout: 4000 }).catch(() => false)) {
+    if (await toolbarIcon.waitFor({ state: 'visible', timeout: 4000 }).then(() => true).catch(() => false)) {
       await toolbarIcon.click();
       await this.dismissAdvancedSettingsTooltip();
     }
@@ -683,7 +1092,7 @@ export class FunnelBuilderPage {
   private async dismissAdvancedSettingsTooltip(): Promise<void> {
     const tooltip = this.page.getByText('Advanced Settings×', { exact: false })
       .or(this.page.getByText(/^Advanced Settings/i));
-    if (await tooltip.first().isVisible({ timeout: 2000 }).catch(() => false)) {
+    if (await tooltip.first().waitFor({ state: 'visible', timeout: 2000 }).then(() => true).catch(() => false)) {
       await tooltip.first().click().catch(() => {});
       await this.page.waitForTimeout(500);
     }
@@ -715,7 +1124,7 @@ export class FunnelBuilderPage {
       if (await isOpenSignal()) return true;
 
       const arrowIcon = nextStepAction.locator('svg, [class*="arrow" i], [class*="chevron" i]').first();
-      if (await arrowIcon.isVisible({ timeout: 1500 }).catch(() => false)) {
+      if (await arrowIcon.waitFor({ state: 'visible', timeout: 1500 }).then(() => true).catch(() => false)) {
         await arrowIcon.click({ timeout: 3000 }).catch(() => {});
         await this.page.waitForTimeout(2000);
         if (await isOpenSignal()) return true;
@@ -734,61 +1143,152 @@ export class FunnelBuilderPage {
    */
   private async wireSelectedElementToNextStep(
     funnelName: string | undefined,
-    expectedNextPageName: string | undefined,
-    contextLabel: string
+    targetProductName: string | undefined,
+    contextLabel: string,
+    /** "Link To" choices in order of preference (first one the dropdown offers is used) */
+    linkTo: RegExp[] = [/upsell\s*\/\s*downsell/i]
   ): Promise<boolean> {
-    await this.openElementActionPanel();
-
-    const nextStepAction = this.page.getByRole('button', { name: 'Go To Next Step In Funnel' })
-      .or(this.page.getByRole('button', { name: 'Go To Next Step In Product' })).first();
-    if (!(await nextStepAction.isVisible({ timeout: 4000 }).catch(() => false))) {
-      Logger.warn('FUNNEL_BUILDER', `"Go To Next Step" action not found for ${contextLabel} — element was selected but not wired to a funnel step.`);
+    // Recorded popup ("Edit Button Action" in Advanced Settings):
+    //   Go To Next Step In Funnel -> Select Your Sales Funnel (custom picker) -> funnel
+    //   -> Select your Product (native select, product NAMES) -> Link To: "Upsell / Downsell"
+    const inFunnel = this.page.getByRole('button', { name: 'Go To Next Step In Funnel' }).first();
+    // The action panel may already be open from the previous button; otherwise open it (Style Settings)
+    if (!(await inFunnel.waitFor({ state: 'visible', timeout: 2500 }).then(() => true).catch(() => false))) {
+      await this.openElementActionPanel();
+    }
+    if (!(await inFunnel.waitFor({ state: 'visible', timeout: 8000 }).then(() => true).catch(() => false))) {
+      Logger.warn('FUNNEL_BUILDER', `"Go To Next Step In Funnel" not found for ${contextLabel} - element was selected but not wired.`);
       return false;
     }
 
-    const opened = await this.clickGoToNextStepAndConfirm(nextStepAction, async () => {
-      return (await this.page.getByRole('combobox').count().catch(() => 0)) > 0;
-    });
+    const funnelLabel = this.page.getByText('Select Your Sales Funnel', { exact: true }).first();
+    const opened = await this.clickGoToNextStepAndConfirm(inFunnel, async () => funnelLabel.isVisible().catch(() => false));
     if (!opened) {
-      Logger.warn('FUNNEL_BUILDER', `${contextLabel}: "Go To Next Step" popup never opened after retries (including the arrow icon) — nothing was wired.`);
+      Logger.warn('FUNNEL_BUILDER', `${contextLabel}: "Go To Next Step In Funnel" section never opened - nothing was wired.`);
       return false;
     }
 
-    const comboboxes = this.page.getByRole('combobox');
-    await comboboxes.first().waitFor({ state: 'visible', timeout: 8000 }).catch(() => {});
-    const comboCount = await comboboxes.count();
+    // a) Funnel - custom picker ("--Select a funnel--" or the currently selected funnel)
+    if (funnelName) {
+      const picked = await this.pickFunnelInActionPanel(funnelName, contextLabel);
+      if (!picked) return false;
+    }
 
-    if (comboCount >= 1) {
-      // First dropdown: search for the funnel by name rather than blindly
-      // taking whatever sits first.
-      const funnelLabel = await this.selectComboboxOptionByText(comboboxes.nth(0), funnelName);
-      if (funnelLabel) {
-        Logger.info('FUNNEL_BUILDER', `${contextLabel}: selected funnel "${funnelLabel}".`);
-      } else {
-        Logger.warn('FUNNEL_BUILDER', `${contextLabel}: could NOT confirm the funnel dropdown selected "${funnelName ?? '(default)'}" -- wiring may be pointing at the wrong or no funnel.`);
-      }
-      // Selecting the funnel repopulates the target-step dropdown — give it
-      // a moment before reading/selecting from it.
-      await this.page.waitForTimeout(3000);
-    }
-    if (comboCount >= 2) {
-      // Second dropdown: select the correct product/page for the page we're
-      // currently wiring, not just index 1.
-      const targetLabel = await this.selectComboboxOptionByText(comboboxes.nth(1), expectedNextPageName);
-      if (targetLabel) {
-        Logger.info('FUNNEL_BUILDER', `${contextLabel}: selected next-step target "${targetLabel}" -- confirmed wired to "${expectedNextPageName ?? '(default)'}".`);
-      } else {
-        Logger.warn('FUNNEL_BUILDER', `${contextLabel}: could NOT confirm the target-step dropdown selected "${expectedNextPageName ?? '(default)'}" -- this CTA may not be wired to the correct page. Check manually.`);
-      }
-    }
-    await this.page.waitForTimeout(3000);
+    // b) Product - native <select> listing the funnel's products by name (loads after the funnel)
+    const productBox = this.page.getByRole('combobox').nth(0);
+    const productLabel = await this.selectNativeOptionStrict(productBox, targetProductName, contextLabel, 'product', 20000);
+    if (targetProductName && !productLabel) return false;
 
-    const closeBtn = this.page.getByRole('button', { name: 'Close', exact: true });
-    if (await closeBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
-      await closeBtn.click();
-      await this.page.waitForTimeout(3000);
+    // c) Link To - first preferred option the dropdown offers.
+    //    Empty linkTo = this page has no "Link To" (FE): funnel + product is all it needs.
+    const linkBox = this.page.getByRole('combobox').nth(1);
+    let linkLabel: string | null = null;
+    if (!linkTo.length) {
+      linkLabel = '(not used on this page)';
+    } else if (await linkBox.waitFor({ state: 'visible', timeout: 8000 }).then(() => true).catch(() => false)) {
+      for (let i = 0; i < linkTo.length && !linkLabel; i++) {
+        const last = i === linkTo.length - 1;
+        linkLabel = await this.selectNativeOptionStrict(linkBox, linkTo[i], contextLabel, 'Link To', last ? 8000 : 2500, last ? 'upsell' : undefined);
+      }
+      if (!linkLabel) return false;
+    } else {
+      Logger.warn('FUNNEL_BUILDER', `${contextLabel}: "Link To" dropdown did not appear.`);
+      return false;
     }
+
+    Logger.info('FUNNEL_BUILDER', `✅ ${contextLabel}: Go To Next Step In Funnel -> "${funnelName}" -> "${productLabel ?? '(default)'}"${linkTo.length ? ` -> Link To "${linkLabel}"` : ''}`);
+
+    // Recorded: click the "Advanced Settings" header to finish (commits the selection)
+    await this.page.getByText('Advanced Settings', { exact: true }).first().click({ timeout: 5000 }).catch(() => {});
+    await this.page.waitForTimeout(1500);
     return true;
+  }
+
+  /** Opens the "Select Your Sales Funnel" picker and chooses the funnel by name. */
+  private async pickFunnelInActionPanel(funnelName: string, contextLabel: string): Promise<boolean> {
+    const esc = funnelName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const trigger = this.page
+      .getByRole('button', { name: /--\s*select a funnel\s*--/i })
+      .or(this.page.getByRole('button', { name: new RegExp(`^\\s*${esc}\\s*$`, 'i') }))
+      .first();
+    if (!(await trigger.waitFor({ state: 'visible', timeout: 10000 }).then(() => true).catch(() => false))) {
+      Logger.warn('FUNNEL_BUILDER', `${contextLabel}: funnel picker ("--Select a funnel--") not found.`);
+      return false;
+    }
+    await trigger.click();
+    await this.page.waitForTimeout(800);
+
+    const option = this.page.getByRole('option', { name: funnelName, exact: true });
+    if (!(await option.waitFor({ state: 'visible', timeout: 5000 }).then(() => true).catch(() => false))) {
+      const search = this.page.getByRole('textbox', { name: /search/i }).last();
+      if (await search.isVisible().catch(() => false)) {
+        await search.fill(funnelName);
+        await this.page.waitForTimeout(1000);
+      }
+    }
+    if (!(await option.waitFor({ state: 'visible', timeout: 10000 }).then(() => true).catch(() => false))) {
+      Logger.warn('FUNNEL_BUILDER', `${contextLabel}: funnel "${funnelName}" is not in the funnel picker.`);
+      return false;
+    }
+    await option.click();
+    await this.page.waitForTimeout(2000); // product list loads for the chosen funnel
+    return true;
+  }
+
+  /**
+   * Selects an option in a native <select> by its visible text - STRICT: never falls back to
+   * "first option" (that silently wired buttons to the wrong product). Waits for the option to load.
+   */
+  private async selectNativeOptionStrict(
+    box: Locator,
+    match: string | RegExp | undefined,
+    contextLabel: string,
+    what: string,
+    waitMs: number,
+    valueFallback?: string
+  ): Promise<string | null> {
+    if (!(await box.waitFor({ state: 'visible', timeout: waitMs }).then(() => true).catch(() => false))) {
+      Logger.warn('FUNNEL_BUILDER', `${contextLabel}: "${what}" dropdown did not appear.`);
+      return null;
+    }
+    const read = () =>
+      box.locator('option').evaluateAll((opts) =>
+        opts.map((o) => ({ value: (o as HTMLOptionElement).value, label: (o.textContent || '').replace(/\s+/g, ' ').trim() }))
+      ).catch(() => [] as { value: string; label: string }[]);
+
+    const find = (opts: { value: string; label: string }[]) => {
+      if (!match) return undefined;
+      if (typeof match === 'string') {
+        const m = match.toLowerCase();
+        return opts.find((o) => o.label.toLowerCase() === m) ?? opts.find((o) => o.label.toLowerCase().includes(m));
+      }
+      return opts.find((o) => match.test(o.label)) ?? (valueFallback ? opts.find((o) => o.value === valueFallback) : undefined);
+    };
+
+    let opts = await read();
+    let chosen = find(opts);
+    const end = Date.now() + waitMs;
+    while (!chosen && match && Date.now() < end) {
+      await this.page.waitForTimeout(500);
+      opts = await read();
+      chosen = find(opts);
+    }
+    if (!match) return null;
+    if (!chosen) {
+      Logger.warn('FUNNEL_BUILDER', `${contextLabel}: no "${what}" option matching "${String(match)}". Options: ${opts.map((o) => o.label).join(' | ') || '(none)'}`);
+      return null;
+    }
+    await box.selectOption(chosen.value).catch(() => {});
+    await this.page.waitForTimeout(600);
+    if ((await box.inputValue().catch(() => null)) !== chosen.value) {
+      await box.selectOption(chosen.value).catch(() => {});
+      await this.page.waitForTimeout(600);
+      if ((await box.inputValue().catch(() => null)) !== chosen.value) {
+        Logger.warn('FUNNEL_BUILDER', `${contextLabel}: selecting "${chosen.label}" in "${what}" did not take.`);
+        return null;
+      }
+    }
+    return chosen.label;
   }
 
   /**
@@ -817,7 +1317,7 @@ export class FunnelBuilderPage {
     // action was silently re-triggering funnel selection when "In Product"
     // wasn't found, instead of failing loudly.
     const nextStepAction = this.page.getByRole('button', { name: 'Go To Next Step In Product' });
-    if (!(await nextStepAction.isVisible({ timeout: 4000 }).catch(() => false))) {
+    if (!(await nextStepAction.waitFor({ state: 'visible', timeout: 4000 }).then(() => true).catch(() => false))) {
       Logger.warn('FUNNEL_BUILDER', `"Go To Next Step In Product" action not found for ${contextLabel} — element was selected but not wired.`);
       return false;
     }
@@ -847,8 +1347,8 @@ export class FunnelBuilderPage {
     // actually shown.
     const opened = await this.clickGoToNextStepAndConfirm(nextStepAction, async () => {
       return (
-        (await dropdownTrigger.isVisible({ timeout: 1000 }).catch(() => false)) ||
-        (await addProductDiv.isVisible({ timeout: 1000 }).catch(() => false))
+        (await dropdownTrigger.waitFor({ state: 'visible', timeout: 1000 }).then(() => true).catch(() => false)) ||
+        (await addProductDiv.waitFor({ state: 'visible', timeout: 1000 }).then(() => true).catch(() => false))
       );
     });
     if (!opened) {
@@ -856,13 +1356,13 @@ export class FunnelBuilderPage {
       return false;
     }
 
-    if (await addProductDiv.isVisible({ timeout: 2500 }).catch(() => false)) {
+    if (await addProductDiv.waitFor({ state: 'visible', timeout: 2500 }).then(() => true).catch(() => false)) {
       Logger.info('FUNNEL_BUILDER', `${contextLabel}: clicking "Add Product" step-selector before the product picker...`);
       await addProductDiv.click().catch(() => {});
       await this.page.waitForTimeout(800);
     }
 
-    if (!(await dropdownTrigger.isVisible({ timeout: 6000 }).catch(() => false))) {
+    if (!(await dropdownTrigger.waitFor({ state: 'visible', timeout: 6000 }).then(() => true).catch(() => false))) {
       Logger.warn('FUNNEL_BUILDER', `No target dropdown trigger found for ${contextLabel} — nothing to wire.`);
       return false;
     }
@@ -909,7 +1409,7 @@ export class FunnelBuilderPage {
     await this.page.waitForTimeout(3000);
 
     const closeBtn = this.page.getByRole('button', { name: 'Close', exact: true });
-    if (await closeBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
+    if (await closeBtn.waitFor({ state: 'visible', timeout: 3000 }).then(() => true).catch(() => false)) {
       await closeBtn.click();
       await this.page.waitForTimeout(3000);
     }
@@ -930,63 +1430,62 @@ export class FunnelBuilderPage {
     editorFrame: import('@playwright/test').FrameLocator,
     salesPageName: string,
     funnelName: string | undefined,
-    targetPageName: string
+    targetProductName: string
   ): Promise<void> {
-    Logger.info('FUNNEL_BUILDER', `Looking for a "No thanks" link on "${salesPageName}" to wire to "${targetPageName}"...`);
-
-    const noThanksLink = ctaScope.getByRole('link', {
+    Logger.info('FUNNEL_BUILDER', `Wiring "No thanks" on "${salesPageName}" -> "${targetProductName}"...`);
+    const noThanks = ctaScope.getByRole('link', {
       name: /No,?\s*thanks|No,?\s*thank\s*you|Skip this offer|I don'?t want|No,?\s*I'?ll pass|No,?\s*I don'?t/i,
-    }).or(ctaScope.locator('a, button').filter({
-      hasText: /No,?\s*thanks|No,?\s*thank\s*you|Skip this offer|I don'?t want|No,?\s*I'?ll pass/i,
-    })).first();
+    });
 
-    if (!(await noThanksLink.isVisible({ timeout: 6000 }).catch(() => false))) {
-      // FIX: this used to just skip when the template had no built-in decline
-      // link. Per spec, the sales page should always get a "No thanks" path
-      // wired the same way the main CTA button is -- so insert a decline
-      // button and wire it instead of leaving the path unwired.
-      //
-      // Confirmed via recording: FlexiFunnels ships a dedicated "No Thanks
-      // Button" block (Blocks -> Components -> getByTitle('No Thanks
-      // Button')) distinct from the generic "Button" element -- it comes
-      // pre-labelled "No thanks", so try that FIRST. Only fall back to the
-      // generic addNewCTAButton() (which needs no relabeling either, but
-      // isn't the confirmed decline-specific component) if this template
-      // doesn't render that block.
-      Logger.warn(
-        'FUNNEL_BUILDER',
-        `No "No thanks"-style link found on the "${salesPageName}" template — inserting the dedicated "No Thanks Button" block.`
-      );
-      let newNoThanks = await this.addNoThanksBlock(editorFrame, `"${salesPageName}" No-thanks button`);
-      if (!newNoThanks) {
-        Logger.warn('FUNNEL_BUILDER', `"No Thanks Button" block unavailable for "${salesPageName}" — falling back to a generic button.`);
-        newNoThanks = await this.addNewCTAButton(editorFrame, `"${salesPageName}" No-thanks button`);
+    if ((await noThanks.count().catch(() => 0)) === 0) {
+      Logger.info('FUNNEL_BUILDER', `No "No thanks" link on "${salesPageName}" - adding the "No Thanks Button" block.`);
+      let added = await this.addNoThanksBlock(editorFrame, `"${salesPageName}" No-thanks button`);
+      if (!added) added = await this.addNewCTAButton(editorFrame, `"${salesPageName}" No-thanks button`);
+      if (!added) {
+        throw new Error(`Could not add a "No thanks" button on "${salesPageName}".`);
       }
-      if (!newNoThanks) {
-        Logger.warn('FUNNEL_BUILDER', `Could not add a fallback "No thanks" button on "${salesPageName}" — skipping.`);
-        return;
-      }
-      await newNoThanks.click().catch(() => {});
-      await this.page.waitForTimeout(2000);
-      const wiredNew = await this.wireSelectedElementToNextStep(funnelName, targetPageName, `"${salesPageName}" No-thanks button`);
-      if (wiredNew) {
-        Logger.info('FUNNEL_BUILDER', `✅ Added and wired a new "No thanks" button on "${salesPageName}" -> "${targetPageName}".`);
-      }
-      return;
     }
 
-    await noThanksLink.scrollIntoViewIfNeeded().catch(() => {});
-    // Same two-click requirement as the main CTA: the first click only
-    // selects the link, the second is what opens its editor panel.
-    await noThanksLink.click();
-    await this.page.waitForTimeout(600);
-    await noThanksLink.click();
-    await this.page.waitForTimeout(3000);
+    await this.wireAllMatching(noThanks, funnelName, targetProductName, `"${salesPageName}" No thanks`, 1);
+  }
 
-    const wired = await this.wireSelectedElementToNextStep(funnelName, targetPageName, `"${salesPageName}" No-thanks link`);
-    if (wired) {
-      Logger.info('FUNNEL_BUILDER', `✅ Wired "No thanks" link on "${salesPageName}" -> "${targetPageName}".`);
+  /**
+   * Selects each matching element in the editor (one by one) and wires it:
+   * Go To Next Step In Funnel -> funnel -> product -> Link To "Upsell / Downsell".
+   * Retries each element once; stops with a clear error if one can't be wired.
+   */
+  private async wireAllMatching(
+    elements: import('@playwright/test').Locator,
+    funnelName: string | undefined,
+    targetProductName: string | undefined,
+    contextLabel: string,
+    minCount: number
+  ): Promise<void> {
+    await elements.first().waitFor({ state: 'attached', timeout: 15000 }).catch(() => {});
+    const count = await elements.count().catch(() => 0);
+    if (count < minCount) {
+      await Helpers.captureDiagnosticScreenshot(this.page, `nothing-to-wire-${contextLabel}`);
+      throw new Error(`${contextLabel}: expected at least ${minCount} button(s) to wire, found ${count}.`);
     }
+    Logger.info('FUNNEL_BUILDER', `${contextLabel}: wiring ${count} button(s) -> "${targetProductName ?? '(default)'}"`);
+
+    for (let i = 0; i < count; i++) {
+      const el = elements.nth(i);
+      const label = `${contextLabel} #${i + 1}/${count}`;
+      let wired = false;
+      for (let attempt = 1; attempt <= 2 && !wired; attempt++) {
+        await el.scrollIntoViewIfNeeded().catch(() => {});
+        await el.click({ timeout: 10000 }).catch(() => {}); // select the element
+        await this.page.waitForTimeout(1500);
+        wired = await this.wireSelectedElementToNextStep(funnelName, targetProductName, attempt === 1 ? label : `${label} (retry)`);
+        if (!wired) await this.page.waitForTimeout(1500);
+      }
+      if (!wired) {
+        await Helpers.captureDiagnosticScreenshot(this.page, `cta-not-wired-${label}`);
+        throw new Error(`${label} could not be wired to "${targetProductName ?? '(default)'}". Screenshot saved in test-results/.`);
+      }
+    }
+    Logger.info('FUNNEL_BUILDER', `✅ ${contextLabel}: all ${count} button(s) wired.`);
   }
 
   /**
@@ -1019,7 +1518,7 @@ export class FunnelBuilderPage {
     const sectionScope = (await firstSection.count().catch(() => 0)) > 0 ? firstSection : editorFrame.locator('body');
     const paragraph = sectionScope.locator('p').first();
 
-    const paragraphReady = await paragraph.isVisible({ timeout: 15000 }).catch(() => false);
+    const paragraphReady = await paragraph.waitFor({ state: 'visible', timeout: 15000 }).then(() => true).catch(() => false);
     if (paragraphReady) {
       await paragraph.click().catch(() => {});
       await this.page.waitForTimeout(1000);
@@ -1028,7 +1527,7 @@ export class FunnelBuilderPage {
     }
 
     const componentsBtn = this.page.getByRole('button', { name: 'Components' });
-    if (!(await componentsBtn.isVisible({ timeout: 8000 }).catch(() => false))) {
+    if (!(await componentsBtn.waitFor({ state: 'visible', timeout: 8000 }).then(() => true).catch(() => false))) {
       Logger.warn('FUNNEL_BUILDER', `"Components" panel not found for ${contextLabel}.`);
       return null;
     }
@@ -1036,7 +1535,7 @@ export class FunnelBuilderPage {
     await this.page.waitForTimeout(800);
 
     const elementsBtn = this.page.getByRole('button', { name: 'Elements' });
-    if (!(await elementsBtn.isVisible({ timeout: 8000 }).catch(() => false))) {
+    if (!(await elementsBtn.waitFor({ state: 'visible', timeout: 8000 }).then(() => true).catch(() => false))) {
       Logger.warn('FUNNEL_BUILDER', `"Elements" panel not found for ${contextLabel}.`);
       return null;
     }
@@ -1044,7 +1543,7 @@ export class FunnelBuilderPage {
     await this.page.waitForTimeout(800);
 
     const buttonElementOption = this.page.getByTitle('Button', { exact: true });
-    if (!(await buttonElementOption.isVisible({ timeout: 8000 }).catch(() => false))) {
+    if (!(await buttonElementOption.waitFor({ state: 'visible', timeout: 8000 }).then(() => true).catch(() => false))) {
       Logger.warn('FUNNEL_BUILDER', `"Button" element option not found for ${contextLabel}.`);
       return null;
     }
@@ -1067,7 +1566,7 @@ export class FunnelBuilderPage {
     // so it can be targeted directly instead of guessing "whatever is last
     // on the canvas".
     const namedInserted = editorFrame.getByRole('link', { name: 'Click Here to Get Access' }).last();
-    if (await namedInserted.isVisible({ timeout: 6000 }).catch(() => false)) {
+    if (await namedInserted.waitFor({ state: 'visible', timeout: 6000 }).then(() => true).catch(() => false)) {
       return namedInserted;
     }
 
@@ -1083,7 +1582,7 @@ export class FunnelBuilderPage {
     const countAfter = await editorFrame.locator(candidateSelector).count().catch(() => countBefore);
     if (countAfter > countBefore) {
       const inserted = editorFrame.locator(candidateSelector).last();
-      if (await inserted.isVisible({ timeout: 8000 }).catch(() => false)) {
+      if (await inserted.waitFor({ state: 'visible', timeout: 8000 }).then(() => true).catch(() => false)) {
         return inserted;
       }
     }
@@ -1114,13 +1613,13 @@ export class FunnelBuilderPage {
     Logger.info('FUNNEL_BUILDER', `Adding the dedicated "No Thanks Button" block for ${contextLabel}...`);
 
     const blocksBtn = this.page.getByRole('button', { name: 'Blocks' });
-    if (await blocksBtn.isVisible({ timeout: 8000 }).catch(() => false)) {
+    if (await blocksBtn.waitFor({ state: 'visible', timeout: 8000 }).then(() => true).catch(() => false)) {
       await blocksBtn.click();
       await this.page.waitForTimeout(800);
     }
 
     const componentsBtn = this.page.getByRole('button', { name: 'Components' });
-    if (!(await componentsBtn.isVisible({ timeout: 8000 }).catch(() => false))) {
+    if (!(await componentsBtn.waitFor({ state: 'visible', timeout: 8000 }).then(() => true).catch(() => false))) {
       Logger.warn('FUNNEL_BUILDER', `"Components" panel not found for ${contextLabel} (No Thanks block) -- falling back to generic button.`);
       return null;
     }
@@ -1128,7 +1627,7 @@ export class FunnelBuilderPage {
     await this.page.waitForTimeout(800);
 
     const noThanksBlockOption = this.page.getByTitle('No Thanks Button');
-    if (!(await noThanksBlockOption.isVisible({ timeout: 8000 }).catch(() => false))) {
+    if (!(await noThanksBlockOption.waitFor({ state: 'visible', timeout: 8000 }).then(() => true).catch(() => false))) {
       Logger.warn('FUNNEL_BUILDER', `"No Thanks Button" block option not found for ${contextLabel} -- this template may not ship it.`);
       return null;
     }
@@ -1145,7 +1644,7 @@ export class FunnelBuilderPage {
     // "No thanks" (distinct from the generic Button's "Click Here to Get
     // Access"), so it can be targeted directly.
     const namedInserted = editorFrame.getByRole('link', { name: /No,?\s*thanks/i }).last();
-    if (await namedInserted.isVisible({ timeout: 6000 }).catch(() => false)) {
+    if (await namedInserted.waitFor({ state: 'visible', timeout: 6000 }).then(() => true).catch(() => false)) {
       return namedInserted;
     }
 
@@ -1155,7 +1654,7 @@ export class FunnelBuilderPage {
     const countAfter = await editorFrame.locator(candidateSelector).count().catch(() => countBefore);
     if (countAfter > countBefore) {
       const inserted = editorFrame.locator(candidateSelector).last();
-      if (await inserted.isVisible({ timeout: 8000 }).catch(() => false)) {
+      if (await inserted.waitFor({ state: 'visible', timeout: 8000 }).then(() => true).catch(() => false)) {
         return inserted;
       }
     }
@@ -1202,23 +1701,28 @@ export class FunnelBuilderPage {
     await this.page.waitForTimeout(3000);
 
     const searchBox = this.page.getByRole('textbox', { name: 'Search pages…' });
-    if (await searchBox.isVisible({ timeout: 5000 }).catch(() => false)) {
+    if (await searchBox.waitFor({ state: 'visible', timeout: 5000 }).then(() => true).catch(() => false)) {
       await searchBox.click();
       await this.page.waitForTimeout(500);
     }
 
-    let pageRow = this.page.getByText(pageName, { exact: false }).first();
-    if (!(await pageRow.isVisible({ timeout: 10000 }).catch(() => false))) {
+    // Prefer the row whose text is EXACTLY the page name ("FE Sales" must never open "FE Sales Variant");
+    // fall back to "contains" only if there is no exact row.
+    let pageRow = this.page.getByText(pageName, { exact: true }).first();
+    if (!(await pageRow.waitFor({ state: 'visible', timeout: 4000 }).then(() => true).catch(() => false))) {
+      pageRow = this.page.getByText(pageName, { exact: false }).first();
+    }
+    if (!(await pageRow.waitFor({ state: 'visible', timeout: 10000 }).then(() => true).catch(() => false))) {
       // Plain click on the search box wasn't enough to surface this page --
       // actually filter the list by typing into it before giving up.
-      if (await searchBox.isVisible({ timeout: 2000 }).catch(() => false)) {
+      if (await searchBox.waitFor({ state: 'visible', timeout: 2000 }).then(() => true).catch(() => false)) {
         await searchBox.fill(pageName).catch(() => {});
         await this.page.waitForTimeout(800);
         pageRow = this.page.getByText(pageName, { exact: false }).first();
       }
     }
 
-    if (!(await pageRow.isVisible({ timeout: 10000 }).catch(() => false))) {
+    if (!(await pageRow.waitFor({ state: 'visible', timeout: 10000 }).then(() => true).catch(() => false))) {
       Logger.warn('FUNNEL_BUILDER', `Could not find "${pageName}" in the page list.`);
       return false;
     }
@@ -1226,7 +1730,7 @@ export class FunnelBuilderPage {
     await this.page.waitForTimeout(3000);
 
     const editPageLink = this.page.getByRole('link', { name: 'Edit Page' }).first();
-    if (!(await editPageLink.isVisible({ timeout: 10000 }).catch(() => false))) {
+    if (!(await editPageLink.waitFor({ state: 'visible', timeout: 10000 }).then(() => true).catch(() => false))) {
       Logger.warn('FUNNEL_BUILDER', `No "Edit Page" link visible for "${pageName}".`);
       return false;
     }
@@ -1236,7 +1740,7 @@ export class FunnelBuilderPage {
     // Second "Edit Page" click -- confirmed needed for at least the Thank
     // You page; harmless no-op elsewhere if it's not present.
     const secondEditLink = this.page.getByRole('link', { name: 'Edit Page' }).first();
-    if (await secondEditLink.isVisible({ timeout: 2500 }).catch(() => false)) {
+    if (await secondEditLink.waitFor({ state: 'visible', timeout: 2500 }).then(() => true).catch(() => false)) {
       await secondEditLink.click().catch(() => {});
     }
 
@@ -1336,7 +1840,7 @@ export class FunnelBuilderPage {
     // actually there.
     if (noThanksTargetPageName) {
       const noThanksLink = newNoThanks ?? editorFrame.getByRole('link', { name: /No,?\s*thanks/i }).first();
-      if (await noThanksLink.isVisible({ timeout: 6000 }).catch(() => false)) {
+      if (await noThanksLink.waitFor({ state: 'visible', timeout: 6000 }).then(() => true).catch(() => false)) {
         await noThanksLink.click().catch(() => {});
         await this.page.waitForTimeout(1500);
 
@@ -1359,13 +1863,14 @@ export class FunnelBuilderPage {
     // actually registered.
     await this.page.waitForTimeout(3000);
 
+    await saveEditorPage(this.page); // Save first (keeps buttons / wiring / forms), then Publish
     await this.page.getByRole('button', { name: 'Publish Publish the page live.' }).click();
     // Minimum 3-4s settle after Publish so the page actually finishes
     // publishing before anything else touches it.
     await this.page.waitForTimeout(4000);
 
     const publishAsSales = this.page.getByRole('button', { name: 'Publish as Sales Page' });
-    if (await publishAsSales.isVisible({ timeout: 6000 }).catch(() => false)) {
+    if (await publishAsSales.waitFor({ state: 'visible', timeout: 6000 }).then(() => true).catch(() => false)) {
       await publishAsSales.click();
       await this.page.waitForTimeout(3000);
     }
@@ -1373,7 +1878,7 @@ export class FunnelBuilderPage {
     // Confirmed via recording: a "Close" button appears after publishing
     // and needs to be dismissed explicitly.
     const closeBtn = this.page.getByRole('button', { name: 'Close' });
-    if (await closeBtn.isVisible({ timeout: 5000 }).catch(() => false)) {
+    if (await closeBtn.waitFor({ state: 'visible', timeout: 5000 }).then(() => true).catch(() => false)) {
       await closeBtn.click();
       await this.page.waitForTimeout(1000);
     }
@@ -1439,18 +1944,16 @@ export class FunnelBuilderPage {
 
     // Same publish-gating fix as wireSalesPageToProduct: don't discard the
     // wiring result and publish blind. Retry once if unconfirmed.
-    let wired = await this.wireSelectedElementToNextStep(funnelName, expectedNextPageName, `"${salesPageName}" main CTA`);
-    if (!wired) {
-      Logger.warn('FUNNEL_BUILDER', `"${salesPageName}" main CTA was not confirmed wired — retrying once before publishing.`);
-      await this.page.waitForTimeout(1500);
-      wired = await this.wireSelectedElementToNextStep(funnelName, expectedNextPageName, `"${salesPageName}" main CTA (retry)`);
-    }
-    if (!wired) {
-      Logger.warn('FUNNEL_BUILDER', `"${salesPageName}" main CTA still not confirmed wired after retry — publishing anyway, but check this page manually.`);
-    }
+    // Wire EVERY main CTA button on the page (the template's own + the one just added),
+    // so whichever one a buyer clicks goes to the right funnel step.
+    await this.wireAllMatching(
+      ctaScope.getByRole('link', { name: /click here to get access/i }),
+      funnelName,
+      expectedNextPageName,
+      `"${salesPageName}" main CTA`,
+      1
+    );
 
-    // Secondary "No thanks" decline link, only for pages that actually have
-    // a downsell to skip to (OTO1 -> DS1, OTO2 -> DS2).
     if (noThanksTargetPageName) {
       await this.wireNoThanksLink(ctaScope, editorFrame, salesPageName, funnelName, noThanksTargetPageName);
     }
@@ -1460,24 +1963,62 @@ export class FunnelBuilderPage {
     // registered.
     await this.page.waitForTimeout(3000);
 
+    await saveEditorPage(this.page); // Save first (keeps buttons / wiring / forms), then Publish
     await this.page.getByRole('button', { name: 'Publish Publish the page live.' }).click();
     // Minimum 3-4s settle after Publish so the page actually finishes
     // publishing before anything else touches it.
     await this.page.waitForTimeout(4000);
 
     const publishAsSales = this.page.getByRole('button', { name: 'Publish as Sales Page' });
-    if (await publishAsSales.isVisible({ timeout: 6000 }).catch(() => false)) {
+    if (await publishAsSales.waitFor({ state: 'visible', timeout: 6000 }).then(() => true).catch(() => false)) {
       await publishAsSales.click();
       await this.page.waitForTimeout(3000);
     }
 
     const closeBtn = this.page.getByRole('button', { name: 'Close' });
-    if (await closeBtn.isVisible({ timeout: 5000 }).catch(() => false)) {
+    if (await closeBtn.waitFor({ state: 'visible', timeout: 5000 }).then(() => true).catch(() => false)) {
       await closeBtn.click();
       await this.page.waitForTimeout(1000);
     }
 
     Logger.info('FUNNEL_BUILDER', `"${salesPageName}" wired to Funnel & Published!`);
+  }
+
+  /**
+   * Clicks Publish in the editor and drives whatever follows, with a hard time limit so it can never
+   * hang: any "Publish as ..." confirmation (Sales Page / Checkout Page / Thank You ...) is clicked,
+   * then "Close" if offered. Returns when the dialog is gone or after `maxMs`. Throws (with a
+   * screenshot) only if the Publish button itself is missing.
+   */
+  private async publishCurrentPage(label: string, maxMs = 30000): Promise<void> {
+    const publish = this.page.getByRole('button', { name: 'Publish Publish the page live.' })
+      .or(this.page.getByRole('button', { name: /^\s*Publish\s*$/ })).first();
+    if (!(await publish.waitFor({ state: 'visible', timeout: 15000 }).then(() => true).catch(() => false))) {
+      await Helpers.captureDiagnosticScreenshot(this.page, `no-publish-button-${label}`);
+      throw new Error(`"${label}": the Publish button was not found in the editor.`);
+    }
+    await publish.click();
+    const confirm = this.page.getByRole('button', { name: /^\s*Publish as /i }).first();
+    const close = this.page.getByRole('button', { name: 'Close', exact: true }).first();
+    const end = Date.now() + maxMs;
+    let confirmed = false;
+    while (Date.now() < end) {
+      if (!confirmed && (await confirm.isVisible().catch(() => false))) {
+        await confirm.click().catch(() => {});
+        confirmed = true;
+        await this.page.waitForTimeout(2500);
+        continue;
+      }
+      if (await close.isVisible().catch(() => false)) {
+        await close.click().catch(() => {});
+        break;
+      }
+      // dialog gone after we confirmed -> done
+      if (confirmed && !(await confirm.isVisible().catch(() => false))) { await this.page.waitForTimeout(1500); if (!(await close.isVisible().catch(() => false))) break; }
+      await this.page.waitForTimeout(500);
+    }
+    await this.page.waitForTimeout(1500);
+    Logger.info('FUNNEL_BUILDER', `📤 "${label}" publish step finished (${confirmed ? 'confirmed' : 'no confirmation needed'}).`);
   }
 
   /**
@@ -1489,7 +2030,7 @@ export class FunnelBuilderPage {
    * already gives every sales page, instead of being left on whatever state
    * the earlier page-creation pass left them in.
    */
-  private async publishExistingPage(pageName: string, publishAsButtonPattern?: string): Promise<void> {
+  private async publishExistingPage(pageName: string, _publishAsButtonPattern?: string): Promise<void> {
     this.context.recordStep(`Publish Page: ${pageName}`);
     Logger.info('FUNNEL_BUILDER', `Publishing "${pageName}"...`);
 
@@ -1499,28 +2040,8 @@ export class FunnelBuilderPage {
       return;
     }
 
-    const publishBtn = this.page.getByRole('button', { name: 'Publish Publish the page live.' })
-      .or(this.page.getByRole('button', { name: /^Publish$/ })).first();
-    if (!(await publishBtn.isVisible({ timeout: 10000 }).catch(() => false))) {
-      Logger.warn('FUNNEL_BUILDER', `No Publish button found for "${pageName}" — skipping.`);
-      return;
-    }
-    await publishBtn.click();
-    // Minimum 3-4s settle after Publish, same as the sales-page publish
-    // path, so this page actually finishes publishing before anything else
-    // touches it.
-    await this.page.waitForTimeout(4000);
-
-    if (publishAsButtonPattern) {
-      const confirmBtn = this.page.getByRole('button', { name: new RegExp(publishAsButtonPattern.replace(/[().]/g, '.'), 'i') }).first();
-      if (await confirmBtn.isVisible({ timeout: 6000 }).catch(() => false)) {
-        await confirmBtn.click();
-      } else {
-        Logger.warn('FUNNEL_BUILDER', `Expected a "${publishAsButtonPattern}" confirmation for "${pageName}" but it wasn't found.`);
-      }
-    }
-
-    await this.page.waitForTimeout(3000);
+    await saveEditorPage(this.page, pageName); // Save first (keeps buttons / wiring / forms), then Publish
+    await this.publishCurrentPage(pageName);
     Logger.info('FUNNEL_BUILDER', `✅ "${pageName}" published.`);
   }
 

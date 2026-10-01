@@ -113,16 +113,6 @@ export const FREE_TRIAL_SELECTORS = {
   // Paddle Checkout Iframe Elements (Matched to paddle_frame recording)
   paddleFrame: 'iframe[name="paddle_frame"]',
   postcodeInput: 'postcodeInput',
-<<<<<<< HEAD
-=======
-  // Fallbacks: Paddle shows the pincode differently depending on plan
-  postcodeCssFallback:
-    'input[name*="postcode" i], input[name*="postal" i], input[name*="zip" i], input[autocomplete="postal-code"], input[id*="postcode" i]',
-  postcodeLabel: /post\s*code|postal|zip|pin\s*code/i,
-  defaultPostcode: '248001', // valid 6-digit Indian PIN
-  // Button that opens Paddle when a plan shows a 'with card / without card' choice first
-  addCardChoiceBtn: /add (a )?card|with (a )?card|continue with card|enter card|pay with card/i,
->>>>>>> 3b74662e3a642703c199e584d84b4d058f47ff14
   authLocationSubmitBtn: 'combinedAuthenticationLocationFormSubmitButton',
   cardNumberInput: 'cardNumberInput',
   cardholderNameInput: 'cardholderNameInput',
@@ -177,6 +167,7 @@ export const MEMBERSHIP_SELECTORS = {
   intervalMonthlyBtn: 'Monthly',
   intervalQuarterlyBtn: 'Quarterly',
   intervalYearlyBtn: 'Yearly',
+  intervalSixMonthsBtn: '6 Months', // also matched: 'Six Months', 'Half-yearly', 'Semi-annually'
   untilCancelledBtn: 'Until Cancelled (∞)',
   fixedPaymentsBtn: 'Fixed Number of Payments',
   numberOfPaymentsInput: 'e.g.',

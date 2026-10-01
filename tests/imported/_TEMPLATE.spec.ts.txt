@@ -1,0 +1,17 @@
+// Copy this to a new file ending in .spec.ts (or import it from the dashboard) and fill in the steps.
+import { test } from '@playwright/test';
+import { LoginPage } from '../../pages/LoginPage';
+import { AppsPage } from '../../pages/AppsPage';
+import { TEST_CREDENTIALS } from '../../config/test-credentials';
+import { TestContext } from '../../utils/test-context';
+
+test('My new scenario', async ({ page }) => {
+  test.setTimeout(15 * 60 * 1000);
+  const ctx = new TestContext('regular');
+  const login = new LoginPage(page, ctx);
+  await login.openLogin();
+  await login.login(TEST_CREDENTIALS.email, TEST_CREDENTIALS.password);
+
+  // await new AppsPage(page).launchApp('FlexiProof');   // open any app from the Apps page
+  // ...your steps...
+});
